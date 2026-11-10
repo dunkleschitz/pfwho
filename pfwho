@@ -1,0 +1,3733 @@
+#!/usr/bin/env python3
+"""pfwho — which pf.conf rule decided a described first packet, and what
+translation was applied to it on the way.
+
+Static adjudication over a pf.conf file (plus its include / load-anchor
+tree and table files). Never invokes pfctl, never reads the live
+ruleset or /dev/pf, never does DNS. Semantics pinned in
+DESIGN-pfwho.md (PF01-PF38): OpenBSD 7.0 primary dialect, FreeBSD 14.0
+as a second evaluation mode (separate translation phase, PF06).
+Stdlib only.
+"""
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+TRUE, FALSE, UNKNOWN = "TRUE", "FALSE", "UNKNOWN"
+
+
+def tri_not(v):
+    if v == TRUE:
+        return FALSE
+    if v == FALSE:
+        return TRUE
+    return UNKNOWN
+
+
+class ConfigError(Exception):
+    """Config-fatal: exit 2, message names file:line where applicable."""
+
+
+# ------------------------------------------------------------------ names
+
+PORT_NAMES = {
+    "ftp-data": 20, "ftp": 21, "ssh": 22, "telnet": 23, "smtp": 25,
+    "domain": 53, "bootps": 67, "bootpc": 68, "tftp": 69, "www": 80,
+    "http": 80, "pop3": 110, "ntp": 123, "imap": 143, "snmp": 161,
+    "ldap": 389, "https": 443, "submission": 587, "ldaps": 636,
+    "isakmp": 500, "syslog": 514, "auth": 113, "ident": 113,
+    "pop2": 109, "sftp": 115, "uucp": 540, "klogin": 543,
+    "kshell": 544, "dhcpv6-client": 546, "dhcpv6-server": 547,
+    "afpovertcp": 548, "rtsp": 554, "nntps": 563, "submission2": 587,
+    "ipp": 631, "ldp": 646, "aodv": 654, "telnets": 992, "imaps": 993,
+    "pop3s": 995, "socks": 1080, "openvpn": 1194, "spamd": 783,
+    "spamd-sync": 8025, "mysql": 3306, "postgresql": 5432,
+    "postgres": 5432, "redis": 6379, "bgp": 179, "microsoft-ds": 445,
+    "netbios-ns": 137, "netbios-dgm": 138, "netbios-ssn": 139,
+    "kerberos": 88, "ekshell": 545, "rsync": 873, "ftps-data": 989,
+    "ftps": 990, "git": 9418, "mdns": 5353, "llmnr": 5355,
+    "xmpp-client": 5222, "xmpp-server": 5269, "https-alt": 8443,
+    "http-alt": 8080, "proxy": 8080, "squid": 3128, "icap": 1344,
+    "pptp": 1723, "l2tp": 1701, "ipsec-nat-t": 4500, "sip": 5060,
+    "xmpp": 5222, "irc": 194, "ircs": 994, "snmptrap": 162,
+    "ldap2": 389, "route": 520, "timed": 525, "tempo": 526,
+    "courier": 530, "conference": 531, "netnews": 532, "netwall": 533,
+    "gopher": 70, "finger": 79, "kerberos-adm": 749, "whois": 43,
+    "daytime": 13, "echo": 7, "discard": 9, "chargen": 19,
+    "time": 37, "nameserver": 42, "nicname": 43, "tacacs": 49,
+    "re-mail-ck": 50, "sunrpc": 111, "loc-srv": 135, "epmap": 135,
+    "microsoft-sh": 5001, "vnc": 5900, "x11": 6000, "font-service": 7100,
+}
+
+PROTO_NAMES = {
+    "hopopt": 0, "icmp": 1, "igmp": 2, "ggp": 3, "ipencap": 4, "st": 5,
+    "tcp": 6, "egp": 8, "igp": 9, "pup": 12, "udp": 17, "hmp": 20,
+    "xns-idp": 22, "rdp": 27, "iso-tp4": 29, "dccp": 33, "ipv6": 41,
+    "ipv6-route": 43, "ipv6-frag": 44, "idrp": 45, "rsvp": 46, "gre": 47,
+    "mdi": 48, "esp": 50, "ah": 51, "skip": 57, "ipv6-icmp": 58,
+    "icmp6": 58, "ipv6-nonxt": 59, "ipv6-opts": 60, "eigrp": 88,
+    "ospf": 89, "encap": 98, "pim": 103, "vrrp": 112, "l2tp": 115,
+    "sctp": 132, "fc": 133, "udplite": 136, "mpls-in-ip": 137,
+    "manet": 138, "hip": 139, "shim6": 140, "wesp": 141, "rohc": 142,
+    "carp": 112, "pfsync": 240, "divert": 254,
+}
+PROTO_BY_NUM = {}
+for _n, _v in PROTO_NAMES.items():
+    PROTO_BY_NUM.setdefault(_v, _n)
+
+ICMP_TYPES = {
+    "echorep": 0, "unreach": 3, "squench": 4, "redir": 5, "althost": 6,
+    "echoreq": 8, "routeradv": 9, "routersol": 10, "timex": 11,
+    "paramprob": 12, "timereq": 13, "timerep": 14, "inforeq": 15,
+    "inforep": 16, "maskreq": 17, "maskrep": 18, "trace": 30,
+    "dataconv": 31, "mobredir": 32, "ipv6-where": 33, "ipv6-here": 34,
+    "mobregreq": 35, "mobregrep": 36, "skip2": 39, "photuris": 40,
+}
+ICMP6_TYPES = {
+    "unreach": 1, "toobig": 2, "timex": 3, "paramprob": 4,
+    "echoreq": 128, "echorep": 129, "mldq": 130, "mldr": 131,
+    "mldd": 132, "routersol": 133, "routeradv": 134, "neighsol": 135,
+    "neighadv": 136, "redir": 137, "routerrenum": 138, "nodeinfoq": 139,
+    "nodeinfor": 140, "invdsol": 141, "invdadv": 142, "mldr2": 143,
+}
+TOS_NAMES = {"lowdelay": 0x10, "throughput": 0x08, "reliability": 0x04,
+             "mincost": 0x02, "control": 0x0e}
+FLAG_LETTERS = set("FSRPAUEC")
+LABEL_BUILTINS = {"srcaddr", "dstaddr", "srcport", "dstport", "nr",
+                  "proto", "srcmac", "dstmac"}
+
+_name_tables_loaded = False
+
+
+def load_name_tables():
+    """PF15: built-in tables plus /etc/services and /etc/protocols when
+    present (data files, never the network)."""
+    global _name_tables_loaded
+    if _name_tables_loaded:
+        return
+    _name_tables_loaded = True
+    try:
+        with open("/etc/services") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2 or "/" not in parts[1]:
+                    continue
+                try:
+                    num = int(parts[1].split("/")[0])
+                except ValueError:
+                    continue
+                PORT_NAMES.setdefault(parts[0], num)
+                for alias in parts[2:]:
+                    if alias.startswith("#"):
+                        break
+                    PORT_NAMES.setdefault(alias, num)
+    except OSError:
+        pass
+    try:
+        with open("/etc/protocols") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    num = int(parts[1])
+                except ValueError:
+                    continue
+                PROTO_NAMES.setdefault(parts[0], num)
+    except OSError:
+        pass
+
+
+def parse_port_value(tok, file, line):
+    load_name_tables()
+    if tok.isdigit():
+        v = int(tok)
+        if 0 <= v <= 65535:
+            return v
+        raise ConfigError("%s:%d: port %s out of range" % (file, line, tok))
+    if tok in PORT_NAMES:
+        return PORT_NAMES[tok]
+    raise ConfigError("%s:%d: unknown port name %r" % (file, line, tok))
+
+
+def parse_proto_value(tok, file, line):
+    load_name_tables()
+    if tok.isdigit():
+        return int(tok)
+    if tok.lower() in PROTO_NAMES:
+        return PROTO_NAMES[tok.lower()]
+    raise ConfigError("%s:%d: unknown protocol name %r" % (file, line, tok))
+
+
+def proto_name(num):
+    return PROTO_BY_NUM.get(num, str(num))
+
+
+def parse_tos_value(tok):
+    if tok in TOS_NAMES:
+        return TOS_NAMES[tok]
+    try:
+        return int(tok, 0)
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------- logical lines
+
+class LLine:
+    __slots__ = ("file", "line", "text")
+
+    def __init__(self, file, line, text):
+        self.file, self.line, self.text = file, line, text
+
+    def where(self):
+        return "%s:%d" % (self.file, self.line)
+
+
+def _strip_comment(text):
+    """Remove a # comment outside quotes from one physical line."""
+    out = []
+    inq = False
+    for ch in text:
+        if ch == '"':
+            inq = not inq
+            out.append(ch)
+        elif ch == "#" and not inq:
+            break
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def read_logical_lines(path):
+    """Read a file into logical lines: backslash continuations joined,
+    comments stripped, each logical line citing its FIRST physical
+    line (PF-files)."""
+    try:
+        with open(path) as fh:
+            physical = fh.read().splitlines()
+    except OSError as e:
+        raise ConfigError("cannot read %s: %s" % (path, e.strerror or e))
+    out = []
+    buf = None
+    start = 0
+    for idx, raw in enumerate(physical, 1):
+        line = _strip_comment(raw)
+        cont = line.rstrip().endswith("\\")
+        if cont:
+            line = line.rstrip()[:-1]
+        if buf is None:
+            buf = line
+            start = idx
+        else:
+            buf = buf + " " + line.strip()
+        if not cont:
+            if buf.strip():
+                out.append(LLine(path, start, buf.strip()))
+            buf = None
+    if buf is not None and buf.strip():
+        out.append(LLine(path, start, buf.strip()))
+    return out
+
+
+def expand_includes(path, chain, files_read):
+    """Textually expand `include` statements in place (PF-files).
+    Returns a flat list of LLine. Missing file / cycle = config-fatal.
+    files_read collects paths in expansion order."""
+    apath = os.path.abspath(path)
+    if apath in chain:
+        raise ConfigError("include cycle: %s" %
+                          " -> ".join(chain + [apath]))
+    if not os.path.exists(path):
+        raise ConfigError("include file not found: %s (chain: %s)" %
+                          (path, " -> ".join(chain + [apath])))
+    files_read.append(path)
+    lines = read_logical_lines(path)
+    out = []
+    for ll in lines:
+        toks = tokenize(ll.text)
+        if toks and toks[0].text == "include":
+            if len(toks) != 2:
+                raise ConfigError("%s: malformed include" % ll.where())
+            inc = toks[1].text
+            out.extend(expand_includes(inc, chain + [apath], files_read))
+        else:
+            out.append(ll)
+    return out
+
+
+# ------------------------------------------------------------ tokenizer
+
+class Tok:
+    __slots__ = ("text", "quoted")
+
+    def __init__(self, text, quoted=False):
+        self.text, self.quoted = text, quoted
+
+    def __repr__(self):
+        return "Tok(%r%s)" % (self.text, ",q" if self.quoted else "")
+
+
+def tokenize(text):
+    """Whitespace tokenize with {}(), kept separate, quotes preserved
+    as quoted tokens, and `!` split from the following term when it is
+    a negation rather than the != operator."""
+    toks = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == '"':
+            j = text.find('"', i + 1)
+            if j < 0:
+                toks.append(Tok(text[i + 1:], True))
+                break
+            toks.append(Tok(text[i + 1:j], True))
+            i = j + 1
+            continue
+        if ch in "{}(),":
+            toks.append(Tok(ch))
+            i += 1
+            continue
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in '{}(),"':
+            j += 1
+        word = text[i:j]
+        if word.startswith("!") and not word.startswith("!=") \
+                and len(word) > 1:
+            toks.append(Tok("!"))
+            word = word[1:]
+        toks.append(Tok(word))
+        i = j
+    return toks
+
+
+# -------------------------------------------------------------- macros
+
+MACRO_DEF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+RESERVED_WORDS = {
+    "pass", "block", "match", "in", "out", "on", "from", "to", "proto",
+    "port", "all", "any", "quick", "log", "set", "table", "anchor",
+    "include", "antispoof", "queue", "nat", "rdr", "binat", "no",
+    "scrub", "ether", "load", "user", "group", "flags", "state",
+}
+
+
+class Macro:
+    __slots__ = ("name", "value", "file", "line", "uses")
+
+    def __init__(self, name, value, file, line):
+        self.name, self.value = name, value
+        self.file, self.line = file, line
+        self.uses = 0
+
+    def where(self):
+        return "%s:%d" % (self.file, self.line)
+        self.uses = 0
+
+
+def expand_macros(text, macros, file, line, depth=0, seen=()):
+    """Expand $name outside quotes (PF13). Undefined or use-before-def
+    (the macro table only holds definitions seen so far) = fatal.
+    Recursive definitions = fatal naming the cycle."""
+    if depth > 32:
+        raise ConfigError("%s:%d: macro expansion too deep" % (file, line))
+    out = []
+    i, n = 0, len(text)
+    inq = False
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            inq = not inq
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "$" and not inq:
+            m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)", text[i:])
+            if m:
+                name = m.group(1)
+                if name in LABEL_BUILTINS:
+                    out.append("$" + name)
+                    i += len(name) + 1
+                    continue
+                if name in seen:
+                    raise ConfigError(
+                        "%s:%d: recursive macro definition: %s" %
+                        (file, line, " -> ".join(seen + (name,))))
+                mac = macros.get(name)
+                if mac is None:
+                    raise ConfigError(
+                        "%s:%d: undefined macro $%s (macros must be "
+                        "defined before use)" % (file, line, name))
+                mac.uses += 1
+                out.append(expand_macros(mac.value, macros, file, line,
+                                         depth + 1, seen + (name,)))
+                i += len(name) + 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# ----------------------------------------------------------- structures
+
+class AddrTerm:
+    """One address term. kind: any|net|range|table|iface|self|hostname|
+    noroute|urpf|route. data per kind."""
+    __slots__ = ("kind", "net", "lo", "hi", "name", "modifier", "parens",
+                 "display")
+
+    def __init__(self, kind, display, net=None, lo=None, hi=None,
+                 name=None, modifier=None, parens=False):
+        self.kind, self.display = kind, display
+        self.net, self.lo, self.hi = net, lo, hi
+        self.name, self.modifier, self.parens = name, modifier, parens
+
+
+class PortSpec:
+    """op in eq|ne|lt|le|gt|ge|range|xrange|except; a,b bounds."""
+    __slots__ = ("op", "a", "b", "display")
+
+    def __init__(self, op, a, b, display):
+        self.op, self.a, self.b, self.display = op, a, b, display
+
+    def matches(self, port):
+        a, b = self.a, self.b
+        if self.op == "eq":
+            return port == a
+        if self.op == "ne":
+            return port != a
+        if self.op == "lt":
+            return port < a
+        if self.op == "le":
+            return port <= a
+        if self.op == "gt":
+            return port > a
+        if self.op == "ge":
+            return port >= a
+        if self.op == "range":
+            return a <= port <= b
+        if self.op == "xrange":
+            return a < port < b
+        if self.op == "except":
+            return port < a or port > b
+        return False
+
+    def lo_bound(self):
+        return self.a
+
+
+class TransTarget:
+    __slots__ = ("terms", "pool_type", "pool_key", "sticky", "static_port",
+                 "port_mode", "port_num", "port_display", "display")
+
+    def __init__(self):
+        self.terms = []          # list of (negated, AddrTerm)
+        self.pool_type = None
+        self.pool_key = None
+        self.sticky = False
+        self.static_port = False
+        self.port_mode = None    # None | 'single' | 'offset'
+        self.port_num = None
+        self.port_display = None
+        self.display = ""
+
+
+class Rule:
+    __slots__ = (
+        "file", "line", "raw", "anchor", "nr", "action", "block_how",
+        "block_param", "no_trans", "pass_mod", "direction", "log",
+        "quick", "on_spec", "af", "proto", "from_spec", "from_port",
+        "to_spec", "to_port", "flags_term", "icmp_type", "tos",
+        "os_name", "user_spec", "group_spec", "tag_set", "tagged",
+        "received_on", "rdomain", "prio_term", "fragment_term",
+        "allow_opts", "state_mode", "state_raw", "has_limit",
+        "limit_banner", "overload_table", "if_bound", "prob",
+        "nat_to", "rdr_to", "binat_to", "af_to", "route_opts", "rtable", "queue_set",
+        "prio_set", "tos_set", "delay_set", "scrub", "divert", "once",
+        "label", "tracker", "limiter", "other_tokens", "antispoof_ifaces",
+        "antispoof_af", "_dup")
+
+    def __init__(self, file, line, raw, anchor, action):
+        self.file, self.line, self.raw = file, line, raw
+        self.anchor = anchor
+        self.nr = 0
+        self.action = action
+        self.block_how = None
+        self.block_param = None
+        self.no_trans = False
+        self.pass_mod = False
+        self.direction = None
+        self.log = False
+        self.quick = False
+        self.on_spec = None       # (negated, kind, name)
+        self.af = None
+        self.proto = None
+        self.from_spec = None
+        self.from_port = None
+        self.to_spec = None
+        self.to_port = None
+        self.flags_term = None    # ('any',) | (set_a, set_b)
+        self.icmp_type = None     # (is6, type, code|None)
+        self.tos = None
+        self.os_name = None
+        self.user_spec = None     # list of (op, value_str)
+        self.group_spec = None
+        self.tag_set = None
+        self.tagged = None        # (negated, str)
+        self.received_on = None   # (negated, name)
+        self.rdomain = None
+        self.prio_term = None
+        self.fragment_term = False
+        self.allow_opts = False
+        self.state_mode = None    # keep|no|modulate|synproxy
+        self.state_raw = ""
+        self.has_limit = False
+        self.limit_banner = None
+        self.overload_table = None
+        self.if_bound = False
+        self.prob = None
+        self.nat_to = None
+        self.rdr_to = None
+        self.binat_to = None
+        self.af_to = None         # (target_af, from_term, to_term)
+        self.route_opts = []      # (kind, display, pooled)
+        self.rtable = None
+        self.queue_set = None
+        self.prio_set = None
+        self.tos_set = None
+        self.delay_set = None
+        self.scrub = None         # ('scrub', raw) | ('noscrub', '')
+        self.divert = None
+        self.once = False
+        self.label = None
+        self.tracker = None
+        self.limiter = False
+        self.other_tokens = []
+        self.antispoof_ifaces = []
+        self.antispoof_af = None
+        self._dup = False
+
+    def where(self):
+        return "%s:%d" % (self.file, self.line)
+
+    def chain_label(self):
+        lab = ' "%s"' % self.label if self.label else ""
+        anch = ""
+        if self.anchor:
+            anch = " [anchor %s]" % " / ".join(self.anchor)
+        return "%s %s%s%s" % (self.where(), self.action, anch, lab)
+
+
+class AnchorNode:
+    __slots__ = ("name", "path", "file", "line", "kind", "params",
+                 "quick", "children", "has_contents", "wildcard")
+
+    def __init__(self, name, path, file, line, kind="filter"):
+        self.name, self.path = name, path
+        self.file, self.line = file, line
+        self.kind = kind
+        self.params = None
+        self.quick = False
+        self.children = []
+        self.has_contents = False
+        self.wildcard = name.endswith("/*")
+
+    def where(self):
+        return "%s:%d" % (self.file, self.line)
+
+
+class Table:
+    __slots__ = ("name", "file", "line", "scope", "attrs", "entries",
+                 "files", "no_list")
+
+    def where(self):
+        return "%s:%d" % (self.file, self.line)
+
+    def __init__(self, name, file, line, scope):
+        self.name, self.file, self.line, self.scope = name, file, line, scope
+        self.attrs = set()
+        self.entries = []         # list of (negated, AddrTerm)
+        self.files = []
+        self.no_list = True       # no { } given at all
+
+    @property
+    def const(self):
+        return "const" in self.attrs
+
+
+class EtherRule:
+    __slots__ = ("file", "line", "raw", "direction", "on_name")
+
+    def __init__(self, file, line, raw):
+        self.file, self.line, self.raw = file, line, raw
+        self.direction = None
+        self.on_name = None
+
+
+# --------------------------------------------------------- term parsers
+
+def classify_addr_token(word, file, line):
+    """Classify one bare address token into an AddrTerm."""
+    if word == "any":
+        return AddrTerm("any", "any")
+    if word == "self":
+        return AddrTerm("self", "self")
+    if word == "no-route":
+        return AddrTerm("noroute", "no-route")
+    if word == "urpf-failed":
+        return AddrTerm("urpf", "urpf-failed")
+    if word.startswith("<") and word.endswith(">") and len(word) > 2:
+        return AddrTerm("table", word, name=word[1:-1])
+    parens = False
+    core = word
+    if core.startswith("(") and core.endswith(")"):
+        parens = True
+        core = core[1:-1]
+    modifier = None
+    base = core
+    for mod in (":network", ":broadcast", ":peer", ":0"):
+        if core.endswith(mod) and len(core) > len(mod):
+            base = core[:-len(mod)]
+            modifier = mod[1:]
+            break
+    try:
+        net = ipaddress.ip_network(base, strict=False)
+        return AddrTerm("net", word, net=net)
+    except ValueError:
+        pass
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", base) and \
+            (parens or modifier or re.search(r"\d", base) or
+             base in ("egress", "lo0")):
+        return AddrTerm("iface", word, name=base, modifier=modifier,
+                        parens=parens)
+    if parens or modifier:
+        return AddrTerm("iface", word, name=base, modifier=modifier,
+                        parens=parens)
+    return AddrTerm("hostname", word, name=word)
+
+
+def parse_addr_term(toks, i, file, line):
+    """Parse one address term at toks[i]; returns (term, next_i)."""
+    t = toks[i]
+    if t.text == "route":
+        lab = toks[i + 1].text if i + 1 < len(toks) else ""
+        return AddrTerm("route", "route %s" % lab, name=lab), i + 2
+    if t.text == "(":
+        # parenthesised interface possibly with modifier inside
+        inner = toks[i + 1].text if i + 1 < len(toks) else ""
+        term = classify_addr_token("(" + inner + ")", file, line)
+        return term, i + 3
+    if t.text.startswith("<"):
+        return classify_addr_token(t.text, file, line), i + 1
+    term = classify_addr_token(t.text, file, line)
+    return term, i + 1
+
+
+def parse_addrspec(toks, i, file, line):
+    """Parse an address spec (single term, negated term, range, or
+    brace list). Returns (spec_list, next_i, was_list) where spec_list
+    is a list of (negated, AddrTerm) alternatives OR'd together --
+    except a range, which is a single term."""
+    if i >= len(toks):
+        raise ConfigError("%s:%d: address spec expected" % (file, line))
+    if toks[i].text == "{":
+        spec = []
+        i += 1
+        while i < len(toks) and toks[i].text != "}":
+            if toks[i].text == ",":
+                i += 1
+                continue
+            neg = False
+            if toks[i].text == "!":
+                neg = True
+                i += 1
+            term, i = parse_addr_term(toks, i, file, line)
+            if i < len(toks) and toks[i].text == "-":
+                hi, i = parse_addr_term(toks, i + 1, file, line)
+                term = _range_term(term, hi, file, line)
+            spec.append((neg, term))
+        if i >= len(toks):
+            raise ConfigError("%s:%d: unterminated list" % (file, line))
+        return spec, i + 1, True
+    neg = False
+    if toks[i].text == "!":
+        neg = True
+        i += 1
+    term, i = parse_addr_term(toks, i, file, line)
+    if i < len(toks) and toks[i].text == "-":
+        hi, i = parse_addr_term(toks, i + 1, file, line)
+        term = _range_term(term, hi, file, line)
+    return [(neg, term)], i, False
+
+
+def _range_term(lo, hi, file, line):
+    if lo.kind != "net" or hi.kind != "net":
+        raise ConfigError("%s:%d: address range needs two literals" %
+                          (file, line))
+    lo_ip = lo.net.network_address
+    hi_ip = hi.net.network_address
+    return AddrTerm("range", "%s - %s" % (lo.display, hi.display),
+                    lo=lo_ip, hi=hi_ip)
+
+
+def parse_portspec_one(toks, i, file, line):
+    """Parse one port spec at toks[i]. Returns (PortSpec, next_i)."""
+    t = toks[i].text
+    if t in ("=", "!=", "<", "<=", ">", ">="):
+        v = parse_port_value(toks[i + 1].text, file, line)
+        op = {"=": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt",
+              ">=": "ge"}[t]
+        return PortSpec(op, v, None, "%s %d" % (t, v)), i + 2
+    # token forms: N, N:M, N:*
+    if ":" in t and not t.startswith("<"):
+        a_s, b_s = t.split(":", 1)
+        a = parse_port_value(a_s, file, line)
+        if b_s == "*":
+            return PortSpec("range", a, 65535, t), i + 1
+        b = parse_port_value(b_s, file, line)
+        return PortSpec("range", a, b, t), i + 1
+    v = parse_port_value(t, file, line)
+    if i + 1 < len(toks) and toks[i + 1].text in ("><", "<>"):
+        op = "xrange" if toks[i + 1].text == "><" else "except"
+        b = parse_port_value(toks[i + 2].text, file, line)
+        return PortSpec(op, v, b, "%d %s %d" % (v, toks[i + 1].text, b)), i + 3
+    if i + 1 < len(toks) and toks[i + 1].text == ":":
+        b = parse_port_value(toks[i + 2].text, file, line)
+        return PortSpec("range", v, b, "%d:%d" % (v, b)), i + 3
+    return PortSpec("eq", v, None, str(v)), i + 1
+
+
+def parse_port_field(toks, i, file, line):
+    """Parse after the `port` keyword. Returns (spec_or_list, next_i,
+    was_list)."""
+    if i < len(toks) and toks[i].text == "{":
+        specs = []
+        i += 1
+        while i < len(toks) and toks[i].text != "}":
+            if toks[i].text == ",":
+                i += 1
+                continue
+            s, i = parse_portspec_one(toks, i, file, line)
+            specs.append(s)
+        if i >= len(toks):
+            raise ConfigError("%s:%d: unterminated port list" % (file, line))
+        return specs, i + 1, True
+    s, i = parse_portspec_one(toks, i, file, line)
+    return s, i, False
+
+
+def _collect_parens(toks, i):
+    """toks[i] must be '('. Returns (inner_text, next_i past ')')."""
+    depth = 0
+    parts = []
+    j = i
+    while j < len(toks):
+        if toks[j].text == "(":
+            depth += 1
+            if depth > 1:
+                parts.append("(")
+        elif toks[j].text == ")":
+            depth -= 1
+            if depth == 0:
+                return " ".join(parts), j + 1
+            parts.append(")")
+        else:
+            parts.append(toks[j].text)
+        j += 1
+    return " ".join(parts), j
+
+
+def _parse_flags(toktext):
+    if toktext == "any":
+        return ("any",)
+    if "/" in toktext:
+        a_s, b_s = toktext.split("/", 1)
+        a = set(c for c in a_s.upper() if c in FLAG_LETTERS)
+        b = set(c for c in b_s.upper() if c in FLAG_LETTERS)
+        return (a, b)
+    s = set(c for c in toktext.upper() if c in FLAG_LETTERS)
+    return (s, s)
+
+
+def parse_trans_target(toks, i, file, line, kind):
+    """Parse a nat-to / rdr-to / binat-to target starting at toks[i].
+    Returns (TransTarget, next_i)."""
+    tt = TransTarget()
+    if i < len(toks) and toks[i].text == "{":
+        spec, i, _ = parse_addrspec(toks, i, file, line)
+        tt.terms = spec
+        tt.display = "{ " + ", ".join(t.display for _, t in spec) + " }"
+    elif i < len(toks) and toks[i].text == "(":
+        # (iface) or (iface addr)
+        inner, ni = _collect_parens(toks, i)
+        words = inner.split()
+        if words:
+            term = classify_addr_token("(" + words[0] + ")", file, line)
+            tt.terms = [(False, term)]
+            tt.display = "(" + inner + ")"
+        i = ni
+    elif i < len(toks):
+        term, i = parse_addr_term(toks, i, file, line)
+        tt.terms = [(False, term)]
+        tt.display = term.display
+    # options after the target
+    while i < len(toks):
+        w = toks[i].text
+        if w in ("bitmask", "random", "round-robin", "least-states"):
+            tt.pool_type = w
+            i += 1
+        elif w == "source-hash":
+            tt.pool_type = "source-hash"
+            i += 1
+            if i < len(toks) and toks[i].text not in RULE_KEYWORDS:
+                tt.pool_key = toks[i].text
+                i += 1
+        elif w == "sticky-address":
+            tt.sticky = True
+            i += 1
+        elif w == "static-port":
+            tt.static_port = True
+            i += 1
+        elif w == "port" and kind in ("rdr", "nat"):
+            if i + 1 < len(toks):
+                spec_tok = toks[i + 1].text
+                if ":" in spec_tok:
+                    a_s, b_s = spec_tok.split(":", 1)
+                    tt.port_num = parse_port_value(a_s, file, line)
+                    tt.port_mode = "offset" if b_s == "*" else "range"
+                    tt.port_display = spec_tok
+                else:
+                    tt.port_num = parse_port_value(spec_tok, file, line)
+                    tt.port_mode = "single"
+                    tt.port_display = spec_tok
+                i += 2
+            else:
+                i += 1
+        else:
+            break
+    return tt, i
+
+
+POOL_KEYWORDS = ("bitmask", "random", "round-robin", "least-states",
+                 "source-hash", "sticky-address", "static-port")
+
+RULE_KEYWORDS = {
+    "in", "out", "log", "quick", "on", "inet", "inet6", "proto", "from",
+    "to", "all", "flags", "icmp-type", "icmp6-type", "tos", "os", "user",
+    "group", "tag", "tagged", "received-on", "rdomain", "prio",
+    "fragment", "allow-opts", "no", "keep", "modulate", "synproxy",
+    "max-pkt-rate", "nat-to", "rdr-to", "binat-to", "af-to", "route-to",
+    "reply-to", "dup-to", "rtable", "queue", "set", "scrub", "divert-to",
+    "divert-packet", "divert-reply", "once", "label", "tracker",
+    "probability", "dnpipe", "dnqueue", "state", "source", "pass",
+    "block", "match", "return", "return-rst", "return-icmp",
+    "return-icmp6", "drop",
+}
+
+
+class RuleParse:
+    """One written rule line -> list of expanded Rule objects via
+    dimensioned list expansion (PF-files: leftmost list slowest)."""
+
+    def __init__(self, parser, ll, anchor):
+        self.parser = parser
+        self.ll = ll
+        self.anchor = anchor
+        self.dims = []      # list of (field_key, [values]) in written order
+        self.base = None
+
+    def add_dim(self, key, values):
+        for k, _ in self.dims:
+            if k == key:
+                return
+        self.dims.append((key, values))
+
+
+def parse_rule_body(parser, toks, ll, anchor, action):
+    """Parse terms of a filter rule starting after the action token.
+    Returns a list of expanded Rule objects (list expansion applied).
+    toks is the FULL token list; parsing starts at index given by
+    parser._body_start (set by caller)."""
+    file, line = ll.file, ll.line
+    rp = RuleParse(parser, ll, anchor)
+    r = Rule(file, line, ll.text, anchor, action)
+    rp.base = r
+    i = parser._body_start
+    if action == "block" and i < len(toks) and \
+            toks[i].text in ("drop", "return", "return-rst",
+                             "return-icmp", "return-icmp6"):
+        r.block_how = toks[i].text
+        i += 1
+        if r.block_how in ("return-icmp", "return-icmp6") and \
+                i < len(toks) and toks[i].text == "(":
+            inner, i = _collect_parens(toks, i)
+            r.block_param = inner
+        elif r.block_how == "return-rst" and i + 1 < len(toks) and \
+                toks[i].text == "ttl":
+            r.block_param = "ttl " + toks[i + 1].text
+            i += 2
+    # block_how stays None when unwritten: the mechanism then comes
+    # from set block-policy, defaulting to drop (PF25).
+    while i < len(toks):
+        w = toks[i].text
+        if w in ("in", "out") and r.direction is None:
+            r.direction = w
+            i += 1
+        elif w == "log":
+            r.log = True
+            i += 1
+            if i < len(toks) and toks[i].text == "(":
+                _, i = _collect_parens(toks, i)
+        elif w == "quick":
+            r.quick = True
+            i += 1
+        elif w == "on":
+            i += 1
+            if i < len(toks) and toks[i].text == "rdomain":
+                r.rdomain = int(toks[i + 1].text)
+                i += 2
+            elif i < len(toks) and toks[i].text == "{":
+                names = []
+                i += 1
+                while i < len(toks) and toks[i].text != "}":
+                    if toks[i].text != ",":
+                        names.append((False, "name", toks[i].text))
+                    i += 1
+                i += 1
+                rp.add_dim("on", names)
+            elif i < len(toks) and toks[i].text == "!":
+                nm = toks[i + 1].text
+                r.on_spec = (True, "name", nm)
+                i += 2
+            elif i < len(toks) and toks[i].text == "(":
+                inner, i = _collect_parens(toks, i)
+                r.on_spec = (False, "name", inner.split()[0])
+            elif i < len(toks):
+                nm = toks[i].text
+                kind = "any" if nm == "any" else \
+                    ("egress" if nm == "egress" else "name")
+                r.on_spec = (False, kind, nm)
+                i += 1
+        elif w in ("inet", "inet6"):
+            r.af = "inet" if w == "inet" else "inet6"
+            i += 1
+        elif w == "proto":
+            i += 1
+            if i < len(toks) and toks[i].text == "{":
+                vals = []
+                i += 1
+                while i < len(toks) and toks[i].text != "}":
+                    if toks[i].text != ",":
+                        vals.append(parse_proto_value(toks[i].text,
+                                                      file, line))
+                    i += 1
+                i += 1
+                rp.add_dim("proto", vals)
+            elif i < len(toks):
+                r.proto = parse_proto_value(toks[i].text, file, line)
+                i += 1
+        elif w in ("from", "to"):
+            side = w
+            i += 1
+            if i < len(toks) and toks[i].text == "all":
+                spec = [(False, AddrTerm("any", "any"))]
+                i += 1
+                was_list = False
+            else:
+                spec, i, was_list = parse_addrspec(toks, i, file, line)
+            if was_list and len(spec) > 1:
+                rp.add_dim(side, [[s] for s in spec])
+            else:
+                setattr(r, side + "_spec", spec)
+            if i < len(toks) and toks[i].text == "port":
+                ps, i, was_list = parse_port_field(toks, i + 1, file, line)
+                if was_list:
+                    rp.add_dim(side + "_port", ps)
+                else:
+                    setattr(r, side + "_port", ps)
+        elif w == "all":
+            if r.from_spec is None:
+                r.from_spec = [(False, AddrTerm("any", "any"))]
+            if r.to_spec is None:
+                r.to_spec = [(False, AddrTerm("any", "any"))]
+            i += 1
+        elif w == "flags":
+            r.flags_term = _parse_flags(toks[i + 1].text)
+            i += 2
+        elif w in ("icmp-type", "icmp6-type"):
+            is6 = w == "icmp6-type"
+            tv = toks[i + 1].text
+            table = ICMP6_TYPES if is6 else ICMP_TYPES
+            if tv.isdigit():
+                tnum = int(tv)
+            elif tv in table:
+                tnum = table[tv]
+            else:
+                raise ConfigError("%s:%d: unknown icmp type %r" %
+                                  (file, line, tv))
+            code = None
+            i += 2
+            if i + 1 < len(toks) and toks[i].text == "code":
+                cv = toks[i + 1].text
+                code = int(cv) if cv.isdigit() else code
+                i += 2
+            r.icmp_type = (is6, tnum, code)
+        elif w == "tos":
+            i += 1
+            if i < len(toks) and toks[i].text == "!":
+                i += 1
+            if i < len(toks):
+                r.tos = parse_tos_value(toks[i].text)
+                i += 1
+        elif w == "os":
+            r.os_name = toks[i + 1].text
+            i += 2
+        elif w in ("user", "group"):
+            field = "user_spec" if w == "user" else "group_spec"
+            i += 1
+            specs = []
+            if i < len(toks) and toks[i].text == "{":
+                i += 1
+                while i < len(toks) and toks[i].text != "}":
+                    if toks[i].text != ",":
+                        specs.append(("eq", toks[i].text))
+                    i += 1
+                i += 1
+            else:
+                op = "eq"
+                if i < len(toks) and toks[i].text in (
+                        "=", "!=", "<", "<=", ">", ">=", "><", "<>"):
+                    op = toks[i].text
+                    i += 1
+                if i < len(toks):
+                    specs.append((op, toks[i].text))
+                    i += 1
+            setattr(r, field, specs)
+        elif w == "tag":
+            r.tag_set = toks[i + 1].text
+            i += 2
+        elif w == "tagged":
+            r.tagged = (False, toks[i + 1].text)
+            i += 2
+        elif w == "!" and i + 1 < len(toks) and \
+                toks[i + 1].text == "tagged":
+            r.tagged = (True, toks[i + 2].text)
+            i += 3
+        elif w == "received-on":
+            r.received_on = (False, toks[i + 1].text)
+            i += 2
+        elif w == "!" and i + 1 < len(toks) and \
+                toks[i + 1].text == "received-on":
+            r.received_on = (True, toks[i + 2].text)
+            i += 3
+        elif w == "rdomain":
+            r.rdomain = int(toks[i + 1].text)
+            i += 2
+        elif w == "prio":
+            if i + 1 < len(toks) and toks[i + 1].text == "(":
+                _, i = _collect_parens(toks, i + 1)
+            else:
+                r.prio_term = int(toks[i + 1].text)
+                i += 2
+        elif w == "fragment":
+            r.fragment_term = True
+            i += 1
+        elif w == "allow-opts":
+            r.allow_opts = True
+            i += 1
+        elif w == "no" and i + 1 < len(toks) and toks[i + 1].text == "state":
+            r.state_mode = "no"
+            i += 2
+        elif w == "no" and i + 1 < len(toks) and toks[i + 1].text == "scrub":
+            r.scrub = ("noscrub", "")
+            i += 2
+        elif w in ("keep", "modulate", "synproxy") and \
+                i + 1 < len(toks) and toks[i + 1].text == "state":
+            r.state_mode = "keep" if w == "keep" else w
+            i += 2
+            if i < len(toks) and toks[i].text == "(":
+                inner, i = _collect_parens(toks, i)
+                r.state_raw = inner
+                _apply_state_opts(r, inner)
+        elif w == "max-pkt-rate":
+            r.has_limit = True
+            r.limit_banner = "[rate-or-capacity-limit-runtime]"
+            i += 2
+        elif w in ("nat-to", "rdr-to", "binat-to"):
+            kind = {"nat-to": "nat", "rdr-to": "rdr",
+                    "binat-to": "binat"}[w]
+            tt, i = parse_trans_target(toks, i + 1, file, line, kind)
+            if w == "nat-to":
+                r.nat_to = tt
+            elif w == "rdr-to":
+                r.rdr_to = tt
+            else:
+                # binat-to: expanded into nat/rdr halves by the
+                # caller after expansion (PF05/PF08).
+                r.binat_to = tt
+        elif w == "af-to":
+            i += 1
+            taf = toks[i].text
+            i += 1
+            fterm = tterm = None
+            if i < len(toks) and toks[i].text == "from":
+                spec, i, _ = parse_addrspec(toks, i + 1, file, line)
+                fterm = spec[0][1]
+            if i < len(toks) and toks[i].text == "to":
+                spec, i, _ = parse_addrspec(toks, i + 1, file, line)
+                tterm = spec[0][1]
+            r.af_to = (taf, fterm, tterm)
+        elif w in ("route-to", "reply-to", "dup-to"):
+            kind = w
+            i += 1
+            pooled = False
+            if i < len(toks) and toks[i].text == "(":
+                inner, i = _collect_parens(toks, i)
+                disp = "(" + inner + ")"
+            elif i < len(toks) and toks[i].text == "{":
+                spec, i, _ = parse_addrspec(toks, i, file, line)
+                disp = "{ " + ", ".join(t.display for _, t in spec) + " }"
+                pooled = True
+            elif i < len(toks):
+                term = classify_addr_token(toks[i].text, file, line)
+                disp = term.display
+                if term.kind == "net" and term.net.num_addresses > 1:
+                    pooled = True
+                i += 1
+            else:
+                disp = ""
+            r.route_opts.append((kind, disp, pooled))
+        elif w == "rtable":
+            r.rtable = int(toks[i + 1].text)
+            i += 2
+        elif w == "queue":
+            i += 1
+            if i < len(toks) and toks[i].text == "(":
+                inner, i = _collect_parens(toks, i)
+                r.queue_set = inner.split(",")[0].strip()
+            elif i < len(toks):
+                r.queue_set = toks[i].text
+                i += 1
+        elif w == "set" and i + 1 < len(toks):
+            sub = toks[i + 1].text
+            if sub == "queue":
+                i += 2
+                if i < len(toks) and toks[i].text == "(":
+                    inner, i = _collect_parens(toks, i)
+                    r.queue_set = inner.split(",")[0].strip()
+                elif i < len(toks):
+                    r.queue_set = toks[i].text
+                    i += 1
+            elif sub == "prio":
+                vals = []
+                i += 2
+                if i < len(toks) and toks[i].text == "(":
+                    inner, i = _collect_parens(toks, i)
+                    vals = inner.split(",")
+                elif i < len(toks):
+                    vals = [toks[i].text]
+                    i += 1
+                if vals:
+                    try:
+                        r.prio_set = int(vals[0].strip())
+                    except ValueError:
+                        pass
+            elif sub == "tos":
+                if i + 2 < len(toks):
+                    r.tos_set = parse_tos_value(toks[i + 2].text)
+                i += 3
+            elif sub == "delay":
+                if i + 2 < len(toks):
+                    r.delay_set = toks[i + 2].text
+                i += 3
+            else:
+                r.other_tokens.append("set " + sub)
+                i += 2
+        elif w == "scrub":
+            i += 1
+            if i < len(toks) and toks[i].text == "(":
+                inner, i = _collect_parens(toks, i)
+                r.scrub = ("scrub", inner)
+            else:
+                r.scrub = ("scrub", "")
+        elif w in ("divert-to", "divert-packet", "divert-reply"):
+            if w == "divert-to" and i + 3 < len(toks):
+                r.divert = "divert-to %s port %s" % (toks[i + 1].text,
+                                                     toks[i + 3].text)
+                i += 4
+            elif w == "divert-packet" and i + 2 < len(toks):
+                r.divert = "divert-packet port %s" % toks[i + 2].text
+                i += 3
+            else:
+                r.divert = w
+                i += 1
+        elif w == "once":
+            r.once = True
+            i += 1
+        elif w == "label":
+            r.label = toks[i + 1].text if i + 1 < len(toks) else ""
+            i += 2
+        elif w == "tracker":
+            r.tracker = toks[i + 1].text if i + 1 < len(toks) else ""
+            parser.has_tracker = True
+            i += 2
+        elif w == "probability":
+            v = toks[i + 1].text.rstrip("%")
+            try:
+                r.prob = float(v)
+            except ValueError:
+                r.prob = None
+            i += 2
+        elif w in ("dnpipe", "dnqueue"):
+            if not r.queue_set:
+                r.queue_set = toks[i + 1].text if i + 1 < len(toks) else ""
+            i += 2
+        elif w == "state" and i + 1 < len(toks) and \
+                toks[i + 1].text == "limiter":
+            r.limiter = True
+            i += 3  # state limiter "name"
+        elif w == "source" and i + 2 < len(toks) and \
+                toks[i + 1].text == "limiter":
+            r.limiter = True
+            i += 4
+        else:
+            r.other_tokens.append(w)
+            i += 1
+    return rp
+
+
+def _apply_state_opts(r, inner):
+    words = inner.replace(",", " ").split()
+    limit_words = {"max", "max-src-nodes", "max-src-states",
+                   "max-src-conn", "max-src-conn-rate"}
+    for idx, wd in enumerate(words):
+        if wd in limit_words:
+            r.has_limit = True
+            r.limit_banner = "[state-limit-not-checked]"
+        elif wd == "max-pkt-rate":
+            r.has_limit = True
+            r.limit_banner = "[rate-or-capacity-limit-runtime]"
+        elif wd == "overload" and idx + 1 < len(words):
+            r.overload_table = words[idx + 1].strip("<>")
+        elif wd == "if-bound":
+            r.if_bound = True
+
+
+def _clone_rule(r):
+    n = Rule(r.file, r.line, r.raw, r.anchor, r.action)
+    for slot in Rule.__slots__:
+        if slot in ("file", "line", "raw", "anchor", "action"):
+            continue
+        setattr(n, slot, getattr(r, slot))
+    n.route_opts = list(r.route_opts)
+    return n
+
+
+def _term_display(spec):
+    if not spec:
+        return "*"
+    return spec[0][1].display
+
+
+def _substitute_label(label, r):
+    if label is None:
+        return None
+    out = label
+    out = out.replace("$nr", str(r.nr))
+    out = out.replace("$srcaddr", _term_display(r.from_spec))
+    out = out.replace("$dstaddr", _term_display(r.to_spec))
+    out = out.replace("$srcport",
+                      str(r.from_port.a) if r.from_port else "*")
+    out = out.replace("$dstport",
+                      str(r.to_port.a) if r.to_port else "*")
+    out = out.replace("$proto", proto_name(r.proto)
+                      if r.proto is not None else "*")
+    return out
+
+
+def expand_ruleparse(parser, rp):
+    """Apply list-expansion dimensions (leftmost slowest) and the
+    binat-to split; assign rule numbers and substitute labels."""
+    import itertools
+    base = rp.base
+    if not rp.dims:
+        combos = [base]
+    else:
+        combos = []
+        keys = [k for k, _ in rp.dims]
+        value_lists = [v for _, v in rp.dims]
+        for combo in itertools.product(*value_lists):
+            r = _clone_rule(base)
+            for key, val in zip(keys, combo):
+                if key == "on":
+                    r.on_spec = val
+                elif key == "proto":
+                    r.proto = val
+                elif key in ("from", "to"):
+                    setattr(r, key + "_spec", val)
+                elif key in ("from_port", "to_port"):
+                    setattr(r, key, val)
+            combos.append(r)
+    out = []
+    for r in combos:
+        if r.binat_to is not None:
+            tt = r.binat_to
+            halves = []
+            if r.direction in (None, "out"):
+                h = _clone_rule(r)
+                h.binat_to = None
+                h.direction = "out"
+                nt = TransTarget()
+                nt.terms = tt.terms
+                nt.pool_type = tt.pool_type
+                nt.static_port = True   # documented expansion (PF05)
+                nt.display = tt.display
+                h.nat_to = nt
+                halves.append(h)
+            if r.direction in (None, "in"):
+                h = _clone_rule(r)
+                h.binat_to = None
+                h.direction = "in"
+                rt = TransTarget()
+                rt.terms = tt.terms
+                rt.display = tt.display
+                h.rdr_to = rt
+                halves.append(h)
+            out.extend(halves)
+        else:
+            out.append(r)
+    for r in out:
+        parser.rule_counter += 1
+        r.nr = parser.rule_counter
+        r.label = _substitute_label(r.label, r)
+    return out
+
+
+FBSD_ORDER = {"macro": 0, "table": 1, "set": 2, "ether": 3, "scrub": 4,
+              "queue": 5, "trans": 6, "filter": 7}
+FBSD_ONLY_SET = {"state-defaults", "syncookies", "fingerprints",
+                 "hostid"}
+
+
+class Parser:
+    def __init__(self, conf_path):
+        self.conf_path = conf_path
+        self.macros = {}
+        self.tables = {}          # (scope_tuple, name) -> Table
+        self.settings = {
+            "block_policy": "drop",
+            "skip": [],           # list of ifspec strings
+            "skip_lines": [],     # (file, line)
+            "state_policy": None,
+            "state_defaults": None,
+            "reassemble": True,
+            "optimization": None,  # None means default (basic)
+            "syncookies": "never",
+            "fingerprints": None,
+            "require_order": True,
+            "inventory": [],      # (file, line, text) of other set opts
+        }
+        self.items = []           # main ruleset items (Rule|AnchorNode|EtherRule)
+        self.anchors = {}         # path tuple -> AnchorNode
+        self.ether_rules = []
+        self.queue_defs = {}      # name -> (file, line, parent)
+        self.limiters = []        # (file, line, text)
+        self.files_read = []
+        self.findings = []
+        self.rule_counter = 0
+        self.has_tracker = False
+        self.saw_freebsd = False  # dialect selectors (PF07)
+        self.saw_afto = False
+        self.macos_like = False
+        self._body_start = 0
+        self._order_max = -1
+        self._order_seen = []     # (group, file, line, kind)
+
+    # -- dialect helpers
+    def note_freebsd(self, what, ll):
+        self.saw_freebsd = True
+
+    def order_check(self, group, ll, kind):
+        self._order_seen.append((group, ll.file, ll.line, kind))
+        if group < self._order_max:
+            if self.dialect == "freebsd" and \
+                    self.settings["require_order"]:
+                raise ConfigError(
+                    "%s: FreeBSD statement order violation: %s section "
+                    "appears after a later section (set require-order "
+                    "enforced)" % (ll.where(), kind))
+        self._order_max = max(self._order_max, group)
+
+    @property
+    def dialect(self):
+        return self._dialect
+
+    @dialect.setter
+    def dialect(self, v):
+        self._dialect = v
+
+    # -- main entry
+    def parse(self, forced_dialect="auto"):
+        self.files_read = []
+        lines = expand_includes(self.conf_path, [], self.files_read)
+        # First pass over raw lines for dialect selectors + tracker,
+        # so order enforcement and fatal checks know the mode.
+        self._prescan(lines)
+        if forced_dialect != "auto":
+            self._dialect = forced_dialect
+        else:
+            self._dialect = "freebsd" if self.saw_freebsd else "openbsd"
+        if self._dialect == "freebsd" and self.saw_afto:
+            raise ConfigError("dialect contradiction: af-to is "
+                              "OpenBSD-only but the file uses FreeBSD "
+                              "translation statements (PF06/PF07)")
+        if self._dialect == "openbsd" and self.saw_freebsd:
+            raise ConfigError("dialect contradiction: file contains "
+                              "FreeBSD-only statements but OpenBSD "
+                              "dialect was forced (PF07)")
+        self._parse_block(lines, 0, self.items, (), stop_at_brace=False)
+        self._post_checks()
+        return self
+
+    def _prescan(self, lines):
+        for ll in lines:
+            text = ll.text.strip()
+            if not text:
+                continue
+            first = text.split(None, 1)[0]
+            if first in ("nat", "rdr", "binat", "ether", "nat-anchor",
+                         "rdr-anchor", "binat-anchor"):
+                self.saw_freebsd = True
+            if first == "no" and len(text.split()) > 1 and \
+                    text.split()[1] in ("nat", "rdr", "binat"):
+                self.saw_freebsd = True
+            if first in ("nat-anchor", "rdr-anchor", "binat-anchor"):
+                self.macos_like = True
+            if first in ("state", "source") and "limiter" in text:
+                self.saw_freebsd = True
+            if " af-to " in (" " + text) or text.startswith("af-to"):
+                self.saw_afto = True
+            if " tracker " in (" " + text + " "):
+                self.has_tracker = True
+                self.saw_freebsd = True
+            if first == "scrub":
+                # standalone scrub statement selects the second mode
+                self.saw_freebsd = True
+
+    def _post_checks(self):
+        # duplicate expanded rules (PF34)
+        seen = {}
+        all_rules = list(self.iter_rules(self.items))
+        for r in all_rules:
+            key = _rule_signature(r)
+            if key in seen:
+                self.findings.append(
+                    "[duplicate-rule] %s duplicates %s (optimizer "
+                    "removes duplicates; first kept)" %
+                    (r.where(), seen[key].where()))
+                r._dup = True
+            else:
+                seen[key] = r
+        # undefined queue references (PF31)
+        for r in all_rules:
+            if r.queue_set and r.queue_set not in self.queue_defs:
+                self.findings.append(
+                    "[undefined-queue] %s references queue %r with no "
+                    "definition" % (r.where(), r.queue_set))
+        for name, (f, l, parent) in self.queue_defs.items():
+            if parent and parent not in self.queue_defs:
+                self.findings.append(
+                    "[undefined-queue] queue %r at %s:%d references "
+                    "undefined parent %r" % (name, f, l, parent))
+        # no block rule anywhere (PF03)
+        if not any(r.action == "block" for r in all_rules):
+            self.findings.append(
+                "[no-block-rule-in-ruleset] the file contains no block "
+                "rule; everything not explicitly passed is passed by "
+                "default")
+        # antispoof loopback caveat (PF28)
+        has_antispoof = any(r.action == "antispoof" for r in all_rules)
+        if has_antispoof:
+            lo_pass = any(
+                r.action == "pass" and r.on_spec and
+                str(r.on_spec[2]).startswith("lo") for r in all_rules)
+            if not lo_pass:
+                self.findings.append(
+                    "[antispoof-loopback-caveat] antispoof is present "
+                    "and no explicit loopback pass rule exists; "
+                    "antispoof rules interfere with loopback traffic "
+                    "to local addresses")
+        # icmp-type on a non-icmp rule (PF15)
+        for r in all_rules:
+            if r.icmp_type is not None and r.proto is not None:
+                want = 58 if r.icmp_type[0] else 1
+                if r.proto != want:
+                    self.findings.append(
+                        "[icmp-type-on-non-icmp-rule] %s has an %s term "
+                        "but proto %s; it can never match" %
+                        (r.where(), "icmp6-type" if r.icmp_type[0]
+                         else "icmp-type", proto_name(r.proto)))
+        # pfsense anchor assumption (PF37)
+        for node in self.anchors.values():
+            if node.name.rstrip("/*") == "userrules" or \
+                    node.name == "userrules/*":
+                self.findings.append(
+                    "[pfsense-anchor-contents-assumption] file "
+                    "contains anchor \"userrules/*\"; v1 reads rules "
+                    "after the anchor line as main-ruleset rules "
+                    "(documented grammar reading, OQ-13)")
+
+    def iter_rules(self, items):
+        for it in items:
+            if isinstance(it, Rule):
+                yield it
+            elif isinstance(it, AnchorNode):
+                for r in self.iter_rules(it.children):
+                    yield r
+
+    def lookup_table(self, name, from_anchor):
+        scope = tuple(from_anchor)
+        while True:
+            t = self.tables.get((scope, name))
+            if t is not None:
+                return t
+            if not scope:
+                return None
+            scope = scope[:-1]
+
+    # -- block parser
+    def _parse_block(self, lines, i, container, anchor_path,
+                     stop_at_brace):
+        n = len(lines)
+        while i < n:
+            ll = lines[i]
+            text = ll.text.strip()
+            if text == "}":
+                if stop_at_brace:
+                    return i + 1
+                raise ConfigError("%s: unmatched }" % ll.where())
+            m = MACRO_DEF_RE.match(text)
+            if m and m.group(1) not in RESERVED_WORDS and \
+                    not text.startswith(("pass", "block", "match")):
+                name = m.group(1)
+                value = m.group(2).strip()
+                if len(value) >= 2 and value.startswith('"') and \
+                        value.endswith('"'):
+                    value = value[1:-1]
+                self.macros[name] = Macro(name, value, ll.file, ll.line)
+                self.order_check(FBSD_ORDER["macro"], ll, "macro")
+                i += 1
+                continue
+            if m and m.group(1) in RESERVED_WORDS and "=" in text and \
+                    text.split("=")[0].strip() in RESERVED_WORDS and \
+                    not text.split(None, 1)[0] in (
+                        "pass", "block", "match", "set", "table"):
+                raise ConfigError(
+                    "%s: macro name %r is a reserved word" %
+                    (ll.where(), m.group(1)))
+            expanded = expand_macros(text, self.macros, ll.file, ll.line)
+            toks = tokenize(expanded)
+            if not toks:
+                i += 1
+                continue
+            i = self._parse_statement(lines, i, toks, ll, container,
+                                      anchor_path)
+        if stop_at_brace:
+            raise ConfigError("unterminated brace block")
+        return i
+
+    def _gather_braces(self, lines, i, first_toks):
+        """Collect tokens across lines until braces balance. Returns
+        (toks, next_i)."""
+        toks = list(first_toks)
+        depth = sum(1 if t.text == "{" else -1 if t.text == "}"
+                    else 0 for t in toks)
+        j = i + 1
+        while depth > 0 and j < len(lines):
+            ll = lines[j]
+            expanded = expand_macros(ll.text, self.macros, ll.file,
+                                     ll.line)
+            more = tokenize(expanded)
+            toks.extend(more)
+            depth += sum(1 if t.text == "{" else -1 if t.text == "}"
+                         else 0 for t in more)
+            j += 1
+        if depth != 0:
+            raise ConfigError("%s: unterminated { } block" %
+                              lines[i].where())
+        return toks, j
+
+    def _parse_statement(self, lines, i, toks, ll, container, anchor_path):
+        w = toks[0].text
+        file, line = ll.file, ll.line
+        if w == "set":
+            self._parse_set(toks, ll)
+            self.order_check(FBSD_ORDER["set"], ll, "option")
+            return i + 1
+        if w == "table":
+            return self._parse_table(lines, i, toks, ll, anchor_path)
+        if w in ("anchor", "nat-anchor", "rdr-anchor", "binat-anchor"):
+            return self._parse_anchor(lines, i, toks, ll, container,
+                                      anchor_path, w)
+        if w == "load":
+            return self._parse_load(lines, i, toks, ll, container,
+                                    anchor_path)
+        if w == "antispoof":
+            r = self._parse_antispoof(toks, ll, anchor_path)
+            container.append(r)
+            self.order_check(FBSD_ORDER["filter"], ll, "filter")
+            return i + 1
+        if w == "ether":
+            er = EtherRule(file, line, ll.text)
+            for k, t in enumerate(toks):
+                if t.text in ("in", "out"):
+                    er.direction = t.text
+                if t.text == "on" and k + 1 < len(toks):
+                    er.on_name = toks[k + 1].text
+            if self.dialect == "openbsd" and self.saw_freebsd is False:
+                raise ConfigError(
+                    "%s: ether rules do not exist in OpenBSD mode "
+                    "(PF07/PF38)" % ll.where())
+            self.ether_rules.append(er)
+            container.append(er)
+            self.order_check(FBSD_ORDER["ether"], ll, "ether")
+            return i + 1
+        if w == "queue":
+            self._parse_queue(toks, ll)
+            self.order_check(FBSD_ORDER["queue"], ll, "queueing")
+            return i + 1
+        if w == "altq":
+            self.order_check(FBSD_ORDER["queue"], ll, "queueing")
+            return i + 1
+        if w in ("state", "source") and len(toks) > 1 and \
+                toks[1].text == "limiter":
+            _t, ni = self._gather_braces(lines, i, toks) \
+                if any(t.text == "{" for t in toks) else (toks, i + 1)
+            self.limiters.append((file, line, ll.text))
+            self.order_check(FBSD_ORDER["set"], ll, "option")
+            return ni
+        if w in ("nat", "rdr", "binat") or (
+                w == "no" and len(toks) > 1 and
+                toks[1].text in ("nat", "rdr", "binat")):
+            kw = toks[1].text if w == "no" else w
+            rules = self._parse_translation(toks, ll, anchor_path, kw)
+            container.extend(rules)
+            self.order_check(FBSD_ORDER["trans"], ll, "translation")
+            return i + 1
+        if w == "scrub":
+            self.settings["inventory"].append((file, line, ll.text))
+            self.order_check(FBSD_ORDER["scrub"], ll, "normalization")
+            return i + 1
+        if w in ("pass", "block", "match"):
+            self._body_start = 1
+            rp = parse_rule_body(self, toks, ll, anchor_path, w)
+            rules = expand_ruleparse(self, rp)
+            container.extend(rules)
+            self.order_check(FBSD_ORDER["filter"], ll, "filter")
+            return i + 1
+        raise ConfigError("%s: unrecognized statement starting %r" %
+                          (ll.where(), w))
+
+    def _parse_set(self, toks, ll):
+        if len(toks) < 2:
+            return
+        sub = toks[1].text
+        st = self.settings
+        if sub == "block-policy" and len(toks) > 2:
+            st["block_policy"] = toks[2].text
+        elif sub == "skip":
+            # set skip on <ifspec>...
+            names = []
+            k = 2
+            if k < len(toks) and toks[k].text == "on":
+                k += 1
+            while k < len(toks):
+                if toks[k].text not in ("{", "}", ","):
+                    names.append(toks[k].text)
+                k += 1
+            st["skip"].extend(names)
+            st["skip_lines"].append((ll.file, ll.line))
+        elif sub == "state-policy" and len(toks) > 2:
+            st["state_policy"] = toks[2].text
+        elif sub == "state-defaults":
+            st["state_defaults"] = " ".join(t.text for t in toks[2:])
+        elif sub == "reassemble":
+            st["reassemble"] = not (
+                len(toks) > 2 and toks[2].text == "no")
+        elif sub == "ruleset-optimization" and len(toks) > 2:
+            st["optimization"] = toks[2].text
+        elif sub == "syncookies" and len(toks) > 2:
+            st["syncookies"] = toks[2].text
+        elif sub == "fingerprints" and len(toks) > 2:
+            st["fingerprints"] = toks[2].text
+        elif sub == "require-order":
+            val = toks[2].text if len(toks) > 2 else "yes"
+            st["require_order"] = val not in ("no", "off", "0")
+        elif sub in FBSD_ONLY_SET and self.dialect == "freebsd":
+            self.findings.append(
+                "[set-form-unverified-freebsd] %s: set %s acceptance "
+                "in FreeBSD 14.0 is unverified (OQ-7); inventoried" %
+                (ll.where(), sub))
+            st["inventory"].append((ll.file, ll.line, ll.text))
+        else:
+            st["inventory"].append((ll.file, ll.line, ll.text))
+
+    def _parse_table(self, lines, i, toks, ll, anchor_path):
+        file, line = ll.file, ll.line
+        if len(toks) < 2 or not (toks[1].text.startswith("<") and
+                                 toks[1].text.endswith(">")):
+            raise ConfigError("%s: malformed table statement" %
+                              ll.where())
+        name = toks[1].text[1:-1]
+        scope = tuple(anchor_path)
+        if (scope, name) in self.tables:
+            prev = self.tables[(scope, name)]
+            raise ConfigError(
+                "%s: duplicate table definition <%s> (first defined "
+                "at %s:%d)" % (ll.where(), name, prev.file, prev.line))
+        t = Table(name, file, line, scope)
+        self.tables[(scope, name)] = t
+        # gather braces if present and unbalanced on this line
+        has_brace = any(x.text == "{" for x in toks)
+        ni = i + 1
+        if has_brace:
+            depth = sum(1 if x.text == "{" else -1 if x.text == "}"
+                        else 0 for x in toks)
+            if depth != 0:
+                toks, ni = self._gather_braces(lines, i, toks)
+        k = 2
+        while k < len(toks):
+            w = toks[k].text
+            if w in ("const", "persist", "counters"):
+                t.attrs.add(w)
+                k += 1
+            elif w == "{":
+                t.no_list = False
+                entries = []
+                k += 1
+                while k < len(toks) and toks[k].text != "}":
+                    if toks[k].text == ",":
+                        k += 1
+                        continue
+                    neg = False
+                    if toks[k].text == "!":
+                        neg = True
+                        k += 1
+                    term, k = parse_addr_term(toks, k, file, line)
+                    entries.append((neg, term))
+                k += 1
+                t.entries = entries
+            elif w == "file":
+                if k + 1 < len(toks):
+                    t.files.append(toks[k + 1].text)
+                    k += 2
+                else:
+                    k += 1
+            else:
+                k += 1
+        self.order_check(FBSD_ORDER["table"], ll, "table")
+        return ni
+
+    def _anchor_node(self, name, ll, kind, container, anchor_path):
+        base = tuple(anchor_path)
+        path = self._anchor_path(base, name)
+        node = self.anchors.get(path)
+        if node is None:
+            node = AnchorNode(name, path, ll.file, ll.line, kind)
+            self.anchors[path] = node
+            container.append(node)
+        return node
+
+    def _anchor_path(self, base, name):
+        parts = list(base)
+        for comp in name.split("/"):
+            if comp in ("", "."):
+                continue
+            if comp == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(comp)
+        return tuple(parts)
+
+    def _parse_anchor(self, lines, i, toks, ll, container, anchor_path,
+                      kw):
+        kind = {"anchor": "filter", "nat-anchor": "nat",
+                "rdr-anchor": "rdr", "binat-anchor": "binat"}[kw]
+        if kind != "filter":
+            self.macos_like = True
+        if len(toks) < 2:
+            raise ConfigError("%s: anchor without a name" % ll.where())
+        name = toks[1].text
+        node = self._anchor_node(name, ll, kind, container, anchor_path)
+        rest = toks[2:]
+        has_brace = any(t.text == "{" for t in rest)
+        params_toks = []
+        brace_at = None
+        for idx, t in enumerate(rest):
+            if t.text == "{":
+                brace_at = idx
+                break
+            params_toks.append(t)
+        if params_toks:
+            pseudo = Rule(ll.file, ll.line, ll.text, tuple(anchor_path),
+                          "anchor")
+            self._body_start = 0
+            # parse params from a synthetic token list
+            rp = self._parse_anchor_params(params_toks, ll, anchor_path)
+            node.params = rp
+            if rp is not None and rp.quick:
+                node.quick = True
+        if has_brace:
+            after = rest[brace_at + 1:]
+            node.has_contents = True
+            if after and not (len(after) == 1 and after[0].text == "}"):
+                # single-line block: parse inner tokens as statements
+                inner = [t for t in after if t.text != "}"]
+                self._parse_inline_tokens(inner, ll, node)
+                return i + 1
+            return self._parse_block(lines, i + 1, node.children,
+                                     node.path, stop_at_brace=True)
+        self.order_check(FBSD_ORDER["filter" if kind == "filter"
+                                    else "trans"], ll, "anchor")
+        return i + 1
+
+    def _parse_anchor_params(self, toks, ll, anchor_path):
+        # Reuse rule-body parsing on a synthetic rule: prepend nothing;
+        # body parser starts at self._body_start.
+        self._body_start = 0
+        rp = parse_rule_body(self, toks, ll, anchor_path, "anchor")
+        return rp.base
+
+    def _parse_inline_tokens(self, toks, ll, node):
+        # Only simple filter rules are expected inline; split is not
+        # supported for multiple statements on one line.
+        if not toks:
+            return
+        w = toks[0].text
+        if w in ("pass", "block", "match"):
+            self._body_start = 1
+            rp = parse_rule_body(self, toks, ll, node.path, w)
+            node.children.extend(expand_ruleparse(self, rp))
+        elif w in ("anchor", "nat-anchor", "rdr-anchor", "binat-anchor"):
+            raise ConfigError("%s: nested anchor on one line not "
+                              "supported" % ll.where())
+
+    def _parse_load(self, lines, i, toks, ll, container, anchor_path):
+        # load anchor "name" from "file"
+        if len(toks) < 5 or toks[1].text != "anchor":
+            raise ConfigError("%s: malformed load statement" %
+                              ll.where())
+        name = toks[2].text
+        path = None
+        for k, t in enumerate(toks):
+            if t.text == "from" and k + 1 < len(toks):
+                path = toks[k + 1].text
+        if path is None:
+            raise ConfigError("%s: load anchor without from" %
+                              ll.where())
+        node = self._anchor_node(name, ll, "filter", container,
+                                 anchor_path)
+        sub_files = []
+        sub_lines = expand_includes(path, [], sub_files)
+        self.files_read.extend(sub_files)
+        node.has_contents = True
+        self._parse_block(sub_lines, 0, node.children, node.path,
+                          stop_at_brace=False)
+        return i + 1
+
+    def _parse_antispoof(self, toks, ll, anchor_path):
+        r = Rule(ll.file, ll.line, ll.text, tuple(anchor_path),
+                 "antispoof")
+        k = 1
+        ifaces = []
+        while k < len(toks):
+            w = toks[k].text
+            if w == "for":
+                k += 1
+                if k < len(toks) and toks[k].text == "{":
+                    k += 1
+                    while k < len(toks) and toks[k].text != "}":
+                        if toks[k].text != ",":
+                            ifaces.append(toks[k].text)
+                        k += 1
+                    k += 1
+                elif k < len(toks):
+                    ifaces.append(toks[k].text)
+                    k += 1
+            elif w in ("inet", "inet6"):
+                r.antispoof_af = w
+                k += 1
+            elif w == "quick":
+                r.quick = True
+                k += 1
+            else:
+                k += 1
+        r.antispoof_ifaces = ifaces
+        return r
+
+    def _parse_queue(self, toks, ll):
+        # queue name [on iface] [bandwidth ...] [parent name] ...
+        if len(toks) < 2:
+            return
+        name = toks[1].text
+        parent = None
+        for k, t in enumerate(toks):
+            if t.text == "parent" and k + 1 < len(toks):
+                parent = toks[k + 1].text
+        self.queue_defs[name] = (ll.file, ll.line, parent)
+
+    def _parse_translation(self, toks, ll, anchor_path, kind_word):
+        """FreeBSD nat / rdr / binat statements (PF06)."""
+        file, line = ll.file, ll.line
+        r = Rule(file, line, ll.text, tuple(anchor_path), kind_word)
+        k = 1
+        if toks[0].text == "no":
+            # statement form: no nat ... / no rdr ... / no binat ...
+            r.no_trans = True
+            k = 2
+        elif k < len(toks) and toks[k].text == "no":
+            r.no_trans = True
+            k += 1
+        if k < len(toks) and toks[k].text == "pass":
+            r.pass_mod = True
+            k += 1
+        # remaining grammar: [on iface] [af] [proto X] from S [port p]
+        # to D [port p] -> target [port range] [pool opts] [label..]
+        # Reuse the rule-body parser by rewriting: set body start and
+        # let it consume terms until '->'.
+        arrow = None
+        for idx in range(k, len(toks)):
+            if toks[idx].text == "->":
+                arrow = idx
+                break
+        if arrow is None:
+            if r.no_trans:
+                # `no nat ... from X to Y` has no target and no ->
+                head = toks
+                self._body_start = k
+                rp = parse_rule_body(self, head, ll, anchor_path,
+                                     kind_word)
+                for slot in ("direction", "on_spec", "af", "proto",
+                             "from_spec", "from_port", "to_spec",
+                             "to_port", "label", "tracker", "prob",
+                             "other_tokens"):
+                    setattr(r, slot, getattr(rp.base, slot))
+                self.rule_counter += 1
+                r.nr = self.rule_counter
+                return [r]
+            raise ConfigError("%s: translation rule without ->" %
+                              ll.where())
+        head = toks[:arrow]
+        self._body_start = k
+        rp = parse_rule_body(self, head, ll, anchor_path, kind_word)
+        base = rp.base
+        # copy parsed head fields onto r
+        for slot in ("direction", "on_spec", "af", "proto", "from_spec",
+                     "from_port", "to_spec", "to_port", "label",
+                     "tracker", "prob", "other_tokens"):
+            setattr(r, slot, getattr(base, slot))
+        tt, _ = parse_trans_target(toks, arrow + 1, file, line,
+                                   {"nat": "nat", "rdr": "rdr",
+                                    "binat": "binat"}[kind_word])
+        if kind_word == "nat":
+            r.nat_to = tt
+        elif kind_word == "rdr":
+            r.rdr_to = tt
+        else:
+            r.binat_to = tt
+        self.rule_counter += 1
+        r.nr = self.rule_counter
+        return [r]
+
+
+def _rule_signature(r):
+    parts = [str(r.action), str(r.direction), str(r.on_spec),
+             str(r.quick), str(r.af), str(r.proto)]
+    for spec in (r.from_spec, r.to_spec):
+        if spec:
+            parts.append(",".join(
+                ("!" if n else "") + t.display for n, t in spec))
+        else:
+            parts.append("*")
+    parts.append(str(r.from_port.display if r.from_port else None))
+    parts.append(str(r.to_port.display if r.to_port else None))
+    # translation and state options are part of the rule's identity:
+    # a pass with nat-to is not a duplicate of the same pass without
+    parts.append(str(r.nat_to.display if r.nat_to else None))
+    parts.append(str(r.rdr_to.display if r.rdr_to else None))
+    parts.append(str(r.state_mode))
+    parts.append(str(r.tag_set))
+    parts.append(str(r.queue_set))
+    parts.append(str(r.once))
+    return "|".join(parts)
+
+
+# --------------------------------------------------------- query side
+
+class Ctx:
+    def __init__(self, args, parser):
+        self.parser = parser
+        self.direction = args.direction
+        self.iface = args.on
+        self.egress_iface = args.egress
+        self.iface_addr = {}      # name -> [(ip, prefixlen)]
+        for spec in args.iface_addr or []:
+            if "=" not in spec:
+                raise ConfigError("--iface-addr expects IFACE=ADDR")
+            name, addrs = spec.split("=", 1)
+            lst = self.iface_addr.setdefault(name, [])
+            for a in addrs.split(","):
+                if not a:
+                    continue
+                if "/" in a:
+                    ip_s, pl = a.split("/", 1)
+                    lst.append((ipaddress.ip_address(ip_s), int(pl)))
+                else:
+                    ip = ipaddress.ip_address(a)
+                    default_pl = 8 if (ip.version == 4 and
+                                       ip.is_loopback) else \
+                        (128 if ip.version == 6 else 32)
+                    lst.append((ip, default_pl))
+        self.self_addrs = []
+        for a in (args.self_addrs or "").split(","):
+            if a:
+                self.self_addrs.append(ipaddress.ip_address(a))
+        self.iface_groups = {}
+        for spec in args.iface_group or []:
+            if "=" not in spec:
+                raise ConfigError("--iface-group expects NAME=IFACES")
+            name, members = spec.split("=", 1)
+            self.iface_groups[name] = [m for m in members.split(",")
+                                        if m]
+        self.src = ipaddress.ip_address(args.src) if args.src else None
+        self.dst = ipaddress.ip_address(args.dst) if args.dst else None
+        self.sport = args.sport
+        self.dport = args.dport
+        self.proto = args.proto_num
+        self.proto_name = args.proto_name
+        if self.proto is None and self.proto_name:
+            self.proto = PROTO_NAMES.get(self.proto_name)
+        af = args.af
+        if af is None:
+            vers = set()
+            for ip in (self.src, self.dst):
+                if ip is not None:
+                    vers.add(ip.version)
+            if len(vers) == 1:
+                af = "inet" if vers.pop() == 4 else "inet6"
+        self.af = af
+        self.flags = None
+        if args.tcp_flags:
+            tf = args.tcp_flags.upper()
+            if tf == "ANY":
+                self.flags = "any"
+            else:
+                self.flags = set(c for c in tf if c in FLAG_LETTERS)
+        if self.proto == 6 and self.flags is None:
+            self.flags = {"S"}
+        self.icmp_type = args.icmp_type_v   # (type, code|None) or None
+        self.fragment = bool(args.fragment)
+        self.ip_options = bool(args.ip_options)
+        self.tos = args.tos_v
+        self.tag = args.tagged
+        self.user = args.user
+        self.group = args.group
+        self.os_name = args.os
+        self.received_on = args.received_on
+        if self.received_on is None and self.direction == "in":
+            self.received_on = self.iface
+        self.rdomain = args.rdomain
+        self.prio = args.prio if args.prio is not None else 3
+
+
+class Packet:
+    """The working packet; translation rewrites it."""
+    __slots__ = ("src", "dst", "sport", "dport", "af")
+
+    def __init__(self, ctx):
+        self.src = ctx.src
+        self.dst = ctx.dst
+        self.sport = ctx.sport
+        self.dport = ctx.dport
+        self.af = ctx.af
+
+    def copy(self):
+        p = Packet.__new__(Packet)
+        p.src, p.dst = self.src, self.dst
+        p.sport, p.dport = self.sport, self.dport
+        p.af = self.af
+        return p
+
+    def desc(self):
+        def a(ip):
+            return str(ip) if ip is not None else "?"
+        s = a(self.src)
+        d = a(self.dst)
+        if self.sport is not None:
+            s += ":%d" % self.sport
+        if self.dport is not None:
+            d += ":%d" % self.dport
+        return "%s -> %s" % (s, d)
+
+
+# ------------------------------------------------------------ matching
+
+def _addr_in(ip, net):
+    if ip is None or net is None:
+        return UNKNOWN
+    if ip.version != net.version:
+        return FALSE
+    return TRUE if ip in net else FALSE
+
+
+def match_addr_term(term, ip, ctx, side):
+    """Three-valued match of one address term against ip."""
+    p = ctx.parser
+    if term.kind == "any":
+        return TRUE
+    if term.kind == "net":
+        return _addr_in(ip, term.net)
+    if term.kind == "range":
+        if ip is None:
+            return UNKNOWN
+        return TRUE if term.lo <= ip <= term.hi else FALSE
+    if term.kind == "table":
+        t = p.lookup_table(term.name, ())
+        # lookup with the current anchor scope is done by caller; here
+        # tables are resolved against the global scope recorded on the
+        # rule -- see match_spec().
+        return _match_table(t, term.name, ip, ctx)
+    if term.kind == "self":
+        if not ctx.self_addrs:
+            return UNKNOWN
+        if ip is None:
+            return UNKNOWN
+        return TRUE if ip in ctx.self_addrs else FALSE
+    if term.kind == "iface":
+        return _match_iface_addr(term, ip, ctx)
+    if term.kind == "hostname":
+        return UNKNOWN
+    if term.kind in ("noroute", "urpf", "route"):
+        return UNKNOWN
+    return UNKNOWN
+
+
+def _match_iface_addr(term, ip, ctx):
+    name = term.name
+    if name == "egress":
+        if ctx.egress_iface is None:
+            return UNKNOWN
+        name = ctx.egress_iface
+    addrs = ctx.iface_addr.get(name)
+    if not addrs:
+        return UNKNOWN
+    if ip is None:
+        return UNKNOWN
+    for addr, pl in addrs:
+        if addr.version != ip.version:
+            continue
+        if term.modifier == "network":
+            net = ipaddress.ip_network("%s/%d" % (addr, pl),
+                                       strict=False)
+            if ip in net:
+                return TRUE
+        elif term.modifier == "broadcast":
+            net = ipaddress.ip_network("%s/%d" % (addr, pl),
+                                       strict=False)
+            if ip == net.broadcast_address:
+                return TRUE
+        elif term.modifier == "peer":
+            return UNKNOWN
+        elif term.modifier == "0":
+            net = ipaddress.ip_network("%s/%d" % (addr, pl),
+                                       strict=False)
+            if ip in net and ip != addr:
+                return TRUE
+        else:
+            if ip == addr:
+                return TRUE
+    return FALSE
+
+
+def _match_table(t, name, ip, ctx):
+    if t is None:
+        raise ConfigError("table <%s> referenced but never defined" %
+                          name)
+    if ip is None:
+        return UNKNOWN
+    entries = list(t.entries)
+    file_entries = []
+    unknown_bits = []
+    for fname in t.files:
+        try:
+            with open(fname, "r", errors="replace") as fh:
+                for raw in fh:
+                    s = raw.split("#", 1)[0].strip()
+                    if not s:
+                        continue
+                    neg = s.startswith("!")
+                    if neg:
+                        s = s[1:].strip()
+                    try:
+                        net = ipaddress.ip_network(s, strict=False)
+                        file_entries.append(
+                            (neg, AddrTerm("net", s, net=net)))
+                    except ValueError:
+                        unknown_bits.append("table-hostname-unresolved")
+        except OSError:
+            unknown_bits.append("table-file-missing")
+    positive = [e for e in entries + file_entries if not e[0]]
+    negative = [e for e in entries + file_entries if e[0]]
+    for _, term in positive:
+        if match_addr_term_simple(term, ip) == TRUE:
+            return TRUE
+    for _, term in negative:
+        if match_addr_term_simple(term, ip) == TRUE:
+            return FALSE
+    runtime = (not t.const) or t.no_list and not t.entries \
+        or bool(unknown_bits)
+    if runtime:
+        return UNKNOWN
+    return FALSE
+
+
+def match_addr_term_simple(term, ip):
+    if term.kind == "net":
+        return _addr_in(ip, term.net)
+    if term.kind == "range":
+        return TRUE if term.lo <= ip <= term.hi else FALSE
+    if term.kind == "any":
+        return TRUE
+    return UNKNOWN
+
+
+def match_spec(spec, ip, ctx, anchor):
+    """Match an address spec (list of alternatives)."""
+    if spec is None:
+        return TRUE
+    saw_unknown = False
+    for neg, term in spec:
+        if term.kind == "table":
+            t = ctx.parser.lookup_table(term.name, anchor)
+            res = _match_table(t, term.name, ip, ctx)
+        else:
+            res = match_addr_term(term, ip, ctx, None)
+        if neg:
+            res = tri_not(res)
+        if res == TRUE:
+            return TRUE
+        if res == UNKNOWN:
+            saw_unknown = True
+    return UNKNOWN if saw_unknown else FALSE
+
+
+def _match_on(on_spec, ctx):
+    if on_spec is None:
+        return TRUE
+    neg, kind, name = on_spec
+    if kind == "any" or name == "any":
+        res = FALSE if ctx.iface == "lo0" else TRUE
+    elif kind == "egress":
+        if ctx.egress_iface is None:
+            return UNKNOWN
+        res = TRUE if ctx.iface == ctx.egress_iface else FALSE
+    else:
+        if name == ctx.iface:
+            res = TRUE
+        elif name in ctx.iface_groups and \
+                ctx.iface in ctx.iface_groups[name]:
+            res = TRUE
+        else:
+            res = FALSE
+    return tri_not(res) if neg else res
+
+
+def _match_user_group(specs, value):
+    """specs: list of (op, string). value: query string or None."""
+    if specs is None:
+        return TRUE
+    if value is None:
+        return UNKNOWN
+    v_num = int(value) if str(value).isdigit() else None
+    any_unknown = False
+    for op, raw in specs:
+        if raw.isdigit() and v_num is not None:
+            a, b = v_num, int(raw)
+            ok = {"eq": a == b, "!=": a != b, "<": a < b, "<=": a <= b,
+                  ">": a > b, ">=": a >= b}.get(op)
+            if ok:
+                return TRUE
+            if ok is False:
+                continue
+        elif op == "eq":
+            if value == raw:
+                return TRUE
+        elif op == "!=":
+            if value != raw:
+                return TRUE
+        else:
+            # name with a non-equality operator: documented for uids
+            any_unknown = True
+    return UNKNOWN if any_unknown else FALSE
+
+
+def match_rule(r, ctx, pkt, tag, prio):
+    """Three-valued match of rule r against the working packet.
+    Returns (result, limit_hit_bool)."""
+    if r._dup:
+        return FALSE, False
+    res = TRUE
+    limit_hit = False
+
+    def conj(v):
+        nonlocal res
+        if res == FALSE:
+            return
+        if v == FALSE:
+            res = FALSE
+        elif v == UNKNOWN:
+            res = UNKNOWN
+
+    if r.direction is not None and r.direction != ctx.direction:
+        return FALSE, False
+    if r.af is not None and pkt.af is not None and r.af != pkt.af:
+        return FALSE, False
+    if r.af is not None and pkt.af is None:
+        conj(UNKNOWN)
+    conj(_match_on(r.on_spec, ctx))
+    if r.proto is not None:
+        if ctx.proto is None:
+            conj(UNKNOWN)
+        elif r.proto != ctx.proto:
+            conj(FALSE)
+    # addresses
+    conj(match_spec(r.from_spec, pkt.src, ctx, r.anchor))
+    conj(match_spec(r.to_spec, pkt.dst, ctx, r.anchor))
+    # ports
+    if r.from_port is not None:
+        if ctx.proto not in (6, 17) or pkt.sport is None:
+            conj(UNKNOWN if ctx.proto in (6, 17) else FALSE)
+        else:
+            conj(TRUE if r.from_port.matches(pkt.sport) else FALSE)
+    if r.to_port is not None:
+        if ctx.proto not in (6, 17) or pkt.dport is None:
+            conj(UNKNOWN if ctx.proto in (6, 17) else FALSE)
+        else:
+            conj(TRUE if r.to_port.matches(pkt.dport) else FALSE)
+    # tcp flags
+    if ctx.proto == 6:
+        if r.flags_term is not None:
+            if ctx.flags is None or ctx.flags == "any":
+                if r.flags_term != ("any",):
+                    conj(UNKNOWN)
+            elif r.flags_term == ("any",):
+                pass
+            else:
+                a, b = r.flags_term
+                conj(TRUE if (ctx.flags & b) == a else FALSE)
+        else:
+            # PF19 default: a state-creating pass rule behaves as
+            # flags S/SA; block/match/no-state rules behave as any.
+            if r.action == "pass" and r.state_mode != "no":
+                if ctx.flags is not None and ctx.flags != "any":
+                    conj(TRUE if (ctx.flags & {"S", "A"}) == {"S"}
+                         else FALSE)
+    # icmp type
+    if r.icmp_type is not None:
+        is6, tnum, code = r.icmp_type
+        if ctx.proto not in (1, 58):
+            conj(FALSE)
+        elif ctx.icmp_type is None:
+            conj(UNKNOWN)
+        else:
+            qt, qc = ctx.icmp_type
+            if qt != tnum:
+                conj(FALSE)
+            elif code is not None and qc is not None and qc != code:
+                conj(FALSE)
+            elif code is not None and qc is None:
+                conj(UNKNOWN)
+    # tos
+    if r.tos is not None:
+        if ctx.tos is None:
+            conj(UNKNOWN)
+        else:
+            conj(TRUE if ctx.tos == r.tos else FALSE)
+    # os fingerprint
+    if r.os_name is not None:
+        if ctx.proto != 6:
+            conj(FALSE)
+        elif ctx.os_name is None:
+            conj(UNKNOWN)
+        else:
+            conj(TRUE if ctx.os_name == r.os_name else FALSE)
+    # user / group
+    if r.user_spec is not None:
+        if ctx.proto not in (6, 17):
+            conj(FALSE)
+        else:
+            conj(_match_user_group(r.user_spec, ctx.user))
+    if r.group_spec is not None:
+        if ctx.proto not in (6, 17):
+            conj(FALSE)
+        else:
+            conj(_match_user_group(r.group_spec, ctx.group))
+    # tagged
+    if r.tagged is not None:
+        neg, want = r.tagged
+        if tag is None:
+            # could a tag have been set earlier in this walk? handled
+            # by the walk (tag is never None there); CLI-only path:
+            conj(UNKNOWN)
+        else:
+            m = TRUE if tag == want else FALSE
+            conj(tri_not(m) if neg else m)
+    # received-on
+    if r.received_on is not None:
+        neg, name = r.received_on
+        if ctx.received_on is None:
+            conj(UNKNOWN)
+        else:
+            m = TRUE if ctx.received_on == name else FALSE
+            conj(tri_not(m) if neg else m)
+    # rdomain
+    if r.rdomain is not None:
+        if ctx.rdomain is None:
+            conj(UNKNOWN)
+        else:
+            conj(TRUE if ctx.rdomain == r.rdomain else FALSE)
+    # prio term
+    if r.prio_term is not None:
+        conj(TRUE if prio == r.prio_term else FALSE)
+    # fragment handling (PF27)
+    if ctx.fragment:
+        if r.fragment_term:
+            pass  # fragment rules match fragments
+        else:
+            has_l4 = (r.from_port is not None or r.to_port is not None
+                      or r.icmp_type is not None or
+                      r.user_spec is not None or ctx.proto == 6 and
+                      (r.flags_term is not None))
+            if not ctx.parser.settings["reassemble"] and has_l4:
+                conj(FALSE)
+    elif r.fragment_term:
+        conj(FALSE)
+    # ip options (PF03): a rule without allow-opts does not match a
+    # packet carrying IP options.
+    if ctx.ip_options and not r.allow_opts:
+        conj(FALSE)
+    if r.has_limit:
+        limit_hit = True
+    return res, limit_hit
+
+
+# ------------------------------------------------------- translations
+
+def _term_addresses(term, ctx):
+    """(ips, net, unknown) for a translation target term."""
+    if term.kind == "net":
+        if term.net.num_addresses == 1:
+            return [term.net.network_address], None, False
+        return None, term.net, False
+    if term.kind == "iface":
+        name = term.name
+        if name == "egress":
+            if ctx.egress_iface is None:
+                return None, None, True
+            name = ctx.egress_iface
+        addrs = ctx.iface_addr.get(name)
+        if not addrs:
+            return None, None, True
+        want = 4 if ctx.af == "inet" else 6 if ctx.af == "inet6" else None
+        ips = [a for a, _ in addrs
+               if want is None or a.version == want]
+        return ips, None, False
+    if term.kind == "self":
+        if not ctx.self_addrs:
+            return None, None, True
+        return list(ctx.self_addrs), None, False
+    if term.kind == "table":
+        t = ctx.parser.lookup_table(term.name, ())
+        if t is None:
+            return None, None, True
+        ips = []
+        for neg, et in t.entries:
+            if neg:
+                continue
+            if et.kind == "net" and et.net.num_addresses == 1:
+                ips.append(et.net.network_address)
+            elif et.kind == "net":
+                return None, et.net, not t.const
+        return ips, None, not t.const
+    return None, None, True
+
+
+def resolve_translation(tt, pkt, ctx, kind):
+    """Resolve a translation target. Returns dict with:
+    status: exact|pool|wide|unknown|source-hash ; candidates: [ips];
+    net: pool network display; banners: [...]; note: str."""
+    out = {"status": "exact", "candidates": [], "net": None,
+           "banners": [], "note": ""}
+    cand = []
+    net = None
+    unknown = False
+    for neg, term in tt.terms:
+        if neg:
+            unknown = True
+            continue
+        ips, n, unk = _term_addresses(term, ctx)
+        if unk:
+            unknown = True
+        if ips:
+            cand.extend(ips)
+        if n is not None:
+            net = n
+    if tt.pool_type == "source-hash":
+        out["status"] = "source-hash"
+        if tt.pool_key:
+            out["banners"].append("[source-hash-key-unknown]")
+        else:
+            out["banners"].append(
+                "[source-hash-exact-address-not-computed]")
+        return out
+    if tt.sticky:
+        out["banners"].append("[sticky-address-runtime]")
+    if unknown and not cand and net is None:
+        out["status"] = "unknown"
+        return out
+    if tt.pool_type == "bitmask" and net is not None:
+        src_ip = pkt.src if kind == "nat" else pkt.dst
+        if src_ip is not None and src_ip.version == net.version:
+            mask = int(net.netmask)
+            new = ipaddress.ip_address(
+                (int(src_ip) & ~mask) | (int(net.network_address) & mask))
+            out["candidates"] = [new]
+            return out
+        out["status"] = "unknown"
+        return out
+    if net is not None and not cand:
+        if tt.pool_type in ("random", "round-robin", "least-states"):
+            out["banners"].append("[pool-address-not-adjudicated]")
+        if net.num_addresses <= 64:
+            out["status"] = "pool"
+            out["candidates"] = list(net.hosts()) or \
+                [net.network_address]
+            out["net"] = str(net)
+            return out
+        out["status"] = "wide"
+        out["net"] = str(net)
+        out["banners"].append("[pool-address-not-adjudicated]")
+        return out
+    if len(cand) > 1 or tt.pool_type in ("random", "round-robin",
+                                         "least-states"):
+        out["status"] = "pool"
+        out["candidates"] = cand
+        out["banners"].append("[pool-address-not-adjudicated]")
+        return out
+    if cand:
+        out["candidates"] = cand
+        return out
+    out["status"] = "unknown"
+    return out
+
+
+def apply_translation(pkt, kind, tt, res, chosen_ip):
+    """Apply a resolved translation to pkt (mutates). Returns an
+    event dict fragment."""
+    ev = {"kind": kind, "display": tt.display, "banners": res["banners"]}
+    if kind == "nat":
+        old = pkt.src
+        pkt.src = chosen_ip
+        if tt.static_port:
+            ev["port_note"] = "source port kept (static-port)"
+        elif pkt.sport is not None:
+            ev["port_note"] = "source port rewritten (value not modelled)"
+            pkt.sport = None
+        ev["change"] = "src %s -> %s" % (old, chosen_ip)
+    else:  # rdr
+        old = pkt.dst
+        pkt.dst = chosen_ip
+        if tt.port_mode == "single" and pkt.dport is not None:
+            ev["change"] = "dst %s:%s -> %s:%s" % (
+                old, pkt.dport, chosen_ip, tt.port_num)
+            pkt.dport = tt.port_num
+        elif tt.port_mode == "offset" and pkt.dport is not None:
+            ev["change"] = "dst %s:%s -> %s (port offset from %s)" % (
+                old, pkt.dport, chosen_ip, tt.port_display)
+        else:
+            ev["change"] = "dst %s -> %s" % (old, chosen_ip)
+    return ev
+
+
+# --------------------------------------------------------- flattening
+
+def flatten_filter(items, ctx, walk_findings):
+    """Produce the flat filter-walk entry list for one query."""
+    entries = []
+
+    def rec(items, depth):
+        for it in items:
+            if isinstance(it, Rule):
+                if it.action in ("pass", "block", "match"):
+                    entries.append(("rule", it))
+                elif it.action == "antispoof":
+                    entries.extend(_antispoof_entries(it, ctx,
+                                                      walk_findings))
+            elif isinstance(it, EtherRule):
+                continue
+            elif isinstance(it, AnchorNode):
+                if it.kind != "filter":
+                    continue
+                if it.wildcard:
+                    kids = sorted(
+                        (p, n) for p, n in ctx.parser.anchors.items()
+                        if len(p) == len(it.path) and
+                        p[:-1] == it.path[:-1] and p != it.path)
+                    walk_findings.append(
+                        "[anchor-wildcard-runtime-children-possible] "
+                        "anchor %r matched %d in-file child anchor(s); "
+                        "runtime-loaded children are possible" %
+                        (it.name, len(kids)))
+                    if not kids and not it.has_contents:
+                        entries.append(("unknown_anchor", it,
+                                        "wildcard anchor has no in-file "
+                                        "children; runtime children "
+                                        "unknown"))
+                    for _, node in kids:
+                        begin = len(entries)
+                        entries.append(("anchor_begin", node))
+                        rec(node.children, depth + 1)
+                        entries.append(("anchor_end", node, begin))
+                    continue
+                if not it.has_contents:
+                    entries.append(("unknown_anchor", it,
+                                    "anchor contents were loaded at "
+                                    "runtime and are not in the file"))
+                    continue
+                begin = len(entries)
+                entries.append(("anchor_begin", it))
+                rec(it.children, depth + 1)
+                entries.append(("anchor_end", it, begin))
+
+    rec(items, 0)
+    # resolve jump targets: anchor_begin needs index past its end
+    stack = []
+    jumps = {}
+    for idx, e in enumerate(entries):
+        if e[0] == "anchor_begin":
+            stack.append(idx)
+        elif e[0] == "anchor_end":
+            b = stack.pop()
+            jumps[b] = idx + 1
+    out = []
+    for idx, e in enumerate(entries):
+        if e[0] == "anchor_begin":
+            out.append(("anchor_begin", e[1], jumps[idx]))
+        else:
+            out.append(e)
+    return out
+
+
+def _antispoof_entries(rule, ctx, walk_findings):
+    entries = []
+    if ctx.direction != "in":
+        return entries
+    ifaces = rule.antispoof_ifaces or ["lo0"]
+    addrs_known = any(ctx.iface_addr.get(n) for n in ifaces)
+    if not addrs_known:
+        entries.append(("poison",
+                        "[antispoof-address-unknown] antispoof at %s "
+                        "cannot be expanded: no interface addresses "
+                        "were supplied (--iface-addr)" % rule.where()))
+        return entries
+    for name in ifaces:
+        addrs = ctx.iface_addr.get(name, [])
+        for ip, pl in addrs:
+            if rule.antispoof_af == "inet" and ip.version != 4:
+                continue
+            if rule.antispoof_af == "inet6" and ip.version != 6:
+                continue
+            net = ipaddress.ip_network("%s/%d" % (ip, pl), strict=False)
+            net_rule = Rule(rule.file, rule.line, rule.raw,
+                            rule.anchor, "block")
+            net_rule.direction = "in"
+            net_rule.on_spec = (True, "name", name)
+            net_rule.af = "inet" if ip.version == 4 else "inet6"
+            net_rule.from_spec = [(False, AddrTerm("net", str(net),
+                                                   net=net))]
+            net_rule.to_spec = [(False, AddrTerm("any", "any"))]
+            net_rule.block_how = "drop"
+            entries.append(("rule", net_rule))
+            if name != "lo0" and not ip.is_loopback:
+                host_rule = Rule(rule.file, rule.line, rule.raw,
+                                 rule.anchor, "block")
+                host_rule.direction = "in"
+                host_rule.from_spec = [(
+                    False, AddrTerm("net", str(ip),
+                                    net=ipaddress.ip_network(
+                                        "%s/%d" % (ip, ip.max_prefixlen))))]
+                host_rule.to_spec = [(False, AddrTerm("any", "any"))]
+                host_rule.block_how = "drop"
+                entries.append(("rule", host_rule))
+    return entries
+
+
+# ------------------------------------------------------------- outcome
+
+class Outcome:
+    __slots__ = ("verdict", "decider", "mechanism", "translations",
+                 "matched", "banners", "findings", "state",
+                 "unknown_reason", "pkt_after", "coverage",
+                 "branch_notes")
+
+    def __init__(self):
+        self.verdict = None
+        self.decider = None
+        self.mechanism = None
+        self.translations = []
+        self.matched = []
+        self.banners = []
+        self.findings = []
+        self.state = None
+        self.unknown_reason = None
+        self.pkt_after = None
+        self.coverage = []
+        self.branch_notes = []
+
+
+def _state_text(r):
+    if r is None:
+        return None
+    if r.action != "pass":
+        return "state: none"
+    mode = r.state_mode
+    if mode == "no":
+        return "state: none (no state)"
+    if mode == "modulate":
+        return "state: created (modulate state)"
+    if mode == "synproxy":
+        return "state: created (synproxy state)"
+    return "state: created (keep state)"
+
+
+def _block_mechanism(parser, r):
+    how = (r.block_how if r else None) or parser.settings["block_policy"]
+    if how == "drop":
+        return "drop"
+    if how == "return":
+        return "return"
+    if how == "return-rst":
+        return "return-rst"
+    if how in ("return-icmp", "return-icmp6"):
+        param = r.block_param if r and r.block_param else "unreachable"
+        return "%s %s" % (how, param)
+    return how
+
+
+# ---------------------------------------------------------------- walk
+
+class _State:
+    __slots__ = ("pkt", "tag", "prio", "last_bp", "last_bp_limit",
+                 "pending", "matched", "events", "poisons", "unk_bp",
+                 "prob_rule", "limit_banners", "anchor_stack")
+
+    def clone(self):
+        s = _State()
+        s.pkt = self.pkt.copy()
+        s.tag, s.prio = self.tag, self.prio
+        s.last_bp, s.last_bp_limit = self.last_bp, self.last_bp_limit
+        s.pending = self.pending
+        s.matched = list(self.matched)
+        s.events = list(self.events)
+        s.poisons = list(self.poisons)
+        s.unk_bp = list(self.unk_bp)
+        s.prob_rule = self.prob_rule
+        s.limit_banners = set(self.limit_banners)
+        s.anchor_stack = list(self.anchor_stack)
+        return s
+
+
+def _apply_match_translation(st, r, ctx, kind, tt):
+    """A match rule's translation applies immediately (PF05/PF09).
+    May fork the state; returns list of states."""
+    res = resolve_translation(tt, st.pkt, ctx, kind)
+    if res["status"] == "exact":
+        ev = apply_translation(st.pkt, kind, tt, res,
+                               res["candidates"][0])
+        ev["rule"] = r
+        ev["stage"] = "match"
+        st.events.append(ev)
+        return [st]
+    if res["status"] == "pool":
+        out = []
+        for ip in res["candidates"][:16]:
+            s2 = st.clone()
+            ev = apply_translation(s2.pkt, kind, tt, res, ip)
+            ev["rule"] = r
+            ev["stage"] = "match"
+            s2.events.append(ev)
+            out.append(s2)
+        return out
+    if res["status"] == "wide":
+        ev = {"kind": kind, "rule": r, "stage": "match",
+              "display": tt.display, "banners": res["banners"],
+              "change": "%s address chosen from %s at runtime" %
+                        ("src" if kind == "nat" else "dst", res["net"])}
+        st.events.append(ev)
+        if kind == "nat":
+            st.pkt.src = None
+        else:
+            st.pkt.dst = None
+        return [st]
+    # source-hash / unknown: the rewrite happens but the address is
+    # not computable from the file (PF09).
+    st.poisons.append(
+        "translation by %s (%s %s) rewrites the packet, but the "
+        "resulting address cannot be computed from the file %s" %
+        (r.where(), kind + "-to", tt.display,
+         " ".join(res["banners"])))
+    return [st]
+
+
+def _walk_states(entries, ctx, pkt0):
+    """Run the filter walk; returns list of finished _State."""
+    init = _State()
+    init.pkt = pkt0
+    init.tag = ctx.tag
+    init.prio = ctx.prio
+    init.last_bp = None
+    init.last_bp_limit = False
+    init.pending = None
+    init.matched = []
+    init.events = []
+    init.poisons = []
+    init.unk_bp = []
+    init.prob_rule = None
+    init.limit_banners = set()
+    init.anchor_stack = []
+    finished = []
+    work = [(init, 0)]
+    guard = 0
+    while work:
+        guard += 1
+        if guard > 512:
+            break
+        st, idx = work.pop()
+        done = False
+        while idx < len(entries) and not done:
+            e = entries[idx]
+            kind = e[0]
+            if kind == "poison":
+                st.poisons.append(e[1])
+                idx += 1
+                continue
+            if kind == "unknown_anchor":
+                st.poisons.append(
+                    "anchor %r at %s:%d: %s — it could contain a "
+                    "matching quick rule" %
+                    (e[1].name, e[1].file, e[1].line, e[2]))
+                idx += 1
+                continue
+            if kind == "anchor_begin":
+                node, jump = e[1], e[2]
+                if node.params is not None:
+                    pres, _ = match_rule(node.params, ctx, st.pkt,
+                                         st.tag, st.prio)
+                    if pres == FALSE:
+                        idx = jump
+                        continue
+                    if pres == UNKNOWN:
+                        st.poisons.append(
+                            "anchor %r parameters at %s:%d cannot be "
+                            "decided from the supplied packet fields" %
+                            (node.name, node.file, node.line))
+                        idx = jump
+                        continue
+                st.anchor_stack.append([node, False])
+                idx += 1
+                continue
+            if kind == "anchor_end":
+                node = e[1]
+                matched_inside = st.anchor_stack and \
+                    st.anchor_stack[-1][1]
+                if st.anchor_stack:
+                    st.anchor_stack.pop()
+                if node.quick and matched_inside:
+                    done = True
+                idx += 1
+                continue
+            # plain rule
+            r = e[1]
+            res, limit_hit = match_rule(r, ctx, st.pkt, st.tag, st.prio)
+            if st.anchor_stack and res == TRUE:
+                st.anchor_stack[-1][1] = True
+            if r.action == "match":
+                if res == TRUE:
+                    st.matched.append(r)
+                    if limit_hit and r.limit_banner:
+                        st.limit_banners.add(r.limit_banner)
+                    if r.tag_set:
+                        st.tag = r.tag_set
+                    if r.prio_set is not None:
+                        st.prio = r.prio_set
+                    forks = None
+                    if r.nat_to is not None:
+                        forks = _apply_match_translation(
+                            st, r, ctx, "nat", r.nat_to)
+                    elif r.rdr_to is not None:
+                        forks = _apply_match_translation(
+                            st, r, ctx, "rdr", r.rdr_to)
+                    if forks is not None:
+                        if len(forks) == 1 and forks[0] is st:
+                            pass
+                        else:
+                            for f in forks:
+                                work.append((f, idx + 1))
+                            done = True
+                            st = None
+                            break
+                    if r.af_to is not None:
+                        _apply_afto(st, r, ctx)
+                    if r.quick:
+                        done = True
+                elif res == UNKNOWN:
+                    sticky = (r.nat_to is not None or
+                              r.rdr_to is not None or
+                              r.tag_set is not None or
+                              r.queue_set is not None or
+                              r.rtable is not None or r.scrub is not None)
+                    if sticky:
+                        st.poisons.append(
+                            "match rule %s may match and carries "
+                            "options (translation/tag/queue/rtable/"
+                            "scrub) whose effect cannot be decided "
+                            "from the supplied packet fields" %
+                            r.where())
+                    if r.quick:
+                        st.poisons.append(
+                            "match rule %s is quick and may match; "
+                            "whether the walk ends here is undecidable"
+                            % r.where())
+                idx += 1
+                continue
+            # pass / block
+            if res == TRUE:
+                if r.prob is not None and 0 < r.prob < 100:
+                    st.matched.append(r)
+                    if st.prob_rule is None:
+                        st.prob_rule = r
+                    idx += 1
+                    continue
+                st.matched.append(r)
+                st.last_bp = r
+                st.last_bp_limit = bool(limit_hit and r.has_limit)
+                st.unk_bp = []
+                st.prob_rule = None
+                st.pending = None
+                if r.nat_to is not None:
+                    st.pending = ("nat", r.nat_to, r)
+                elif r.rdr_to is not None:
+                    st.pending = ("rdr", r.rdr_to, r)
+                if r.af_to is not None:
+                    _apply_afto_decider(st, r, ctx)
+                if r.quick:
+                    done = True
+                idx += 1
+                continue
+            if res == UNKNOWN:
+                if r.prob is not None and 0 < r.prob < 100:
+                    idx += 1
+                    continue
+                st.unk_bp.append(r)
+                idx += 1
+                continue
+            idx += 1
+        if st is not None:
+            finished.append(st)
+    return finished
+
+
+def _apply_afto(st, r, ctx):
+    """af-to on a match rule [documented for pass/block deciders;
+    match-rule af-to rewrites immediately under the same reading]."""
+    _apply_afto_decider(st, r, ctx)
+
+
+def _apply_afto_decider(st, r, ctx):
+    taf, fterm, tterm = r.af_to
+    ev = {"kind": "af-to", "rule": r, "stage": "rule",
+          "display": "af-to %s" % taf, "banners": []}
+    if ctx.direction == "out":
+        st.poisons.append("af-to on an outbound rule at %s is a "
+                          "configuration error (PF18)" % r.where())
+        return
+    if tterm is not None and tterm.kind == "net":
+        prefix = tterm.net
+        if prefix.prefixlen == 96 and prefix.version == 6 and \
+                st.pkt.dst is not None and st.pkt.dst.version == 4:
+            base = int(prefix.network_address)
+            new_dst = ipaddress.ip_address(base | int(st.pkt.dst))
+            ev["change"] = "dst %s -> %s (af-to /96)" % (st.pkt.dst,
+                                                         new_dst)
+            st.pkt.dst = new_dst
+            st.pkt.af = "inet6"
+            st.events.append(ev)
+            return
+        ev["banners"].append("[af-to-prefix-not-modelled]")
+        ev["change"] = ("destination prefix %s is not a /96; "
+                        "destination not computed" % prefix)
+        st.events.append(ev)
+        st.pkt.dst = None
+        return
+    ev["banners"].append("[af-to-prefix-not-modelled]")
+    ev["change"] = "af-to target not modelled"
+    st.events.append(ev)
+    st.pkt.dst = None
+
+
+def _finish_state(st, ctx, parser):
+    """Turn a finished walk state into an Outcome."""
+    o = Outcome()
+    o.translations = st.events
+    o.matched = st.matched
+    o.pkt_after = st.pkt
+    o.banners.extend(sorted(st.limit_banners))
+    if st.poisons:
+        o.verdict = "UNKNOWN"
+        o.unknown_reason = st.poisons[0]
+        return o
+    if st.prob_rule is not None:
+        o.verdict = "UNKNOWN"
+        o.unknown_reason = ("rule %s matches only with probability "
+                            "%s%% and would decide the packet "
+                            "[probability-rule]" %
+                            (st.prob_rule.where(), st.prob_rule.prob))
+        return o
+    if st.unk_bp:
+        r = st.unk_bp[0]
+        o.verdict = "UNKNOWN"
+        o.unknown_reason = ("rule %s may match (some of its terms "
+                            "cannot be decided from the supplied "
+                            "packet fields) and, as the last matching "
+                            "rule, it would decide the packet" %
+                            r.where())
+        return o
+    if st.last_bp is None:
+        if ctx.ip_options:
+            o.verdict = "BLOCK"
+            o.mechanism = "drop"
+            o.decider = None
+            o.findings.append(
+                "[implicit-pass-rejects-ip-options] no rule matched; "
+                "the packet carries IP options and matches no "
+                "allow-opts rule, so the implicit pass rule rejects "
+                "it (block drop)")
+            o.state = "state: none"
+            return o
+        o.verdict = "DEFAULT-PASS"
+        o.decider = None
+        o.state = "state: none"
+        return o
+    r = st.last_bp
+    o.decider = r
+    if r.action == "pass":
+        o.verdict = "PASS"
+    else:
+        o.verdict = "BLOCK"
+        o.mechanism = _block_mechanism(parser, r)
+    o.state = _state_text(r)
+    if st.last_bp_limit and r.limit_banner:
+        o.banners.append(r.limit_banner)
+    # annotations that never change the verdict (PF23/PF31/PF32)
+    seen_ann = set()
+    for ar in list(st.matched) + [r]:
+        for kind, disp, pooled in ar.route_opts:
+            key = (ar.where(), kind)
+            if key in seen_ann:
+                continue
+            seen_ann.add(key)
+            extra = " (pool: member chosen at runtime)" if pooled \
+                else ""
+            ineff = ""
+            if kind == "reply-to" and ar.state_mode == "no":
+                ineff = " [reply-to-without-state-ineffective]"
+            o.findings.append("%s %s %s [policy-routing]%s%s" %
+                              (ar.where(), kind, disp, extra, ineff))
+        if ar.rtable:
+            o.findings.append(
+                "%s rtable %d [alternate-rtable] — verdict computed "
+                "for the default routing table" % (ar.where(),
+                                                    ar.rtable))
+        if ar.divert:
+            o.findings.append("%s %s [divert]" % (ar.where(),
+                                                  ar.divert))
+            if parser.dialect == "freebsd":
+                o.findings.append(
+                    "%s divert form in the FreeBSD 14.0 grammar is "
+                    "unverified [divert-unverified-freebsd]" %
+                    ar.where())
+        if ar.queue_set:
+            o.findings.append("%s queue %s [queue-assignment]" %
+                              (ar.where(), ar.queue_set))
+        if ar.tos_set is not None:
+            o.findings.append("%s set tos %s [tos-rewrite]" %
+                              (ar.where(), ar.tos_set))
+    # decider's own translation candidate applies now (PF05)
+    if st.pending is not None:
+        kind, tt, trule = st.pending
+        res = resolve_translation(tt, st.pkt, ctx, kind)
+        if res["status"] == "exact":
+            ev = apply_translation(st.pkt, kind, tt, res,
+                                   res["candidates"][0])
+            ev["rule"] = trule
+            ev["stage"] = "decider"
+            o.translations = list(o.translations) + [ev]
+        elif res["status"] == "pool":
+            ev = {"kind": kind, "rule": trule, "stage": "decider",
+                  "display": tt.display, "banners": res["banners"],
+                  "change": "%s rewritten to one of %s (pool)" %
+                            ("src" if kind == "nat" else "dst",
+                             ", ".join(str(x)
+                                       for x in res["candidates"]))}
+            o.translations = list(o.translations) + [ev]
+        elif res["status"] == "wide":
+            ev = {"kind": kind, "rule": trule, "stage": "decider",
+                  "display": tt.display, "banners": res["banners"],
+                  "change": "%s address chosen from %s at runtime" %
+                            ("src" if kind == "nat" else "dst",
+                             res["net"])}
+            o.translations = list(o.translations) + [ev]
+        else:
+            ev = {"kind": kind, "rule": trule, "stage": "decider",
+                  "display": tt.display, "banners": res["banners"],
+                  "change": "%s rewritten by %s; resulting address "
+                            "not computable from the file" %
+                            ("src" if kind == "nat" else "dst",
+                             kind + "-to")}
+            o.translations = list(o.translations) + [ev]
+    return o
+
+
+def merge_outcomes(outcomes):
+    if len(outcomes) == 1:
+        return outcomes[0]
+    verdicts = {o.verdict for o in outcomes}
+    if len(verdicts) == 1:
+        base = outcomes[0]
+        deciders = {id(o.decider) for o in outcomes}
+        if len(deciders) > 1:
+            base.branch_notes.append(
+                "[pool-address-not-adjudicated] pool members agree "
+                "on the verdict but not on a single deciding rule")
+        return base
+    o = Outcome()
+    o.verdict = "AMBIGUOUS"
+    parts = []
+    for oc in outcomes:
+        d = oc.decider.where() if oc.decider else "no rule"
+        parts.append("%s via %s" % (oc.verdict, d))
+    o.unknown_reason = ("pool members disagree: " + "; ".join(parts) +
+                        " [pool-address-not-adjudicated]")
+    o.matched = outcomes[0].matched
+    o.translations = outcomes[0].translations
+    return o
+
+
+# ---------------------------------------------------- FreeBSD phase
+
+def flatten_trans(items, ctx):
+    """Ordered translation-phase entries for the second mode:
+    (rule) | ('unknown_anchor', node)."""
+    out = []
+
+    def rec(items):
+        for it in items:
+            if isinstance(it, Rule) and it.action in ("nat", "rdr",
+                                                      "binat"):
+                out.append(it)
+            elif isinstance(it, AnchorNode) and it.kind in (
+                    "nat", "rdr", "binat"):
+                if it.wildcard:
+                    kids = sorted(
+                        (p, n) for p, n in ctx.parser.anchors.items()
+                        if len(p) == len(it.path) and
+                        p[:-1] == it.path[:-1] and p != it.path)
+                    if not kids and not it.has_contents:
+                        out.append(("unknown_anchor", it))
+                    for _, node in kids:
+                        rec(node.children)
+                elif not it.has_contents:
+                    out.append(("unknown_anchor", it))
+                else:
+                    rec(it.children)
+    rec(items)
+    return out
+
+
+def fbsd_phase(entries, ctx, pkt):
+    """Returns (variants, override, poisons) where variants is a list
+    of (pkt, events) after translation, override an Outcome or None
+    (a translation rule with pass decided), poisons a list."""
+    order_kinds = ["binat", ctx.direction == "in" and "rdr" or "nat"]
+    events = []
+    poisons = []
+    pass_rule = None
+    for want in order_kinds:
+        applied = False
+        for e in entries:
+            if isinstance(e, tuple):
+                poisons.append("translation anchor %r contents are "
+                               "not in the file; an earlier "
+                               "translation may apply" % (e[1].name,))
+                continue
+            r = e
+            if r.action != want:
+                continue
+            if r.direction is not None and r.direction != ctx.direction:
+                continue
+            res, _ = match_rule(r, ctx, pkt, ctx.tag, ctx.prio)
+            if res == UNKNOWN:
+                poisons.append("translation rule %s cannot be "
+                               "decided from the supplied packet "
+                               "fields and precedes any match" %
+                               r.where())
+                continue
+            if res == FALSE:
+                continue
+            # first match wins (PF06)
+            applied = True
+            if r.pass_mod:
+                pass_rule = r
+            if r.no_trans:
+                events.append({"kind": "no-" + want, "rule": r,
+                               "stage": "phase", "display": "",
+                               "banners": [],
+                               "change": "no %s — translation "
+                                         "suppressed" % want})
+                break
+            tt = r.nat_to or r.rdr_to or r.binat_to
+            kind = {"nat": "nat", "rdr": "rdr",
+                    "binat": "nat" if ctx.direction == "out"
+                    else "rdr"}[want]
+            res_t = resolve_translation(tt, pkt, ctx, kind)
+            if res_t["status"] == "exact":
+                ev = apply_translation(pkt, kind, tt, res_t,
+                                       res_t["candidates"][0])
+                ev["rule"] = r
+                ev["stage"] = "phase"
+                events.append(ev)
+            elif res_t["status"] == "pool":
+                variants = []
+                for ip in res_t["candidates"][:16]:
+                    p2 = pkt.copy()
+                    ev = apply_translation(p2, kind, tt, res_t, ip)
+                    ev["rule"] = r
+                    ev["stage"] = "phase"
+                    variants.append((p2, events + [ev]))
+                if pass_rule is not None:
+                    return variants, ("pass_pending", pass_rule), \
+                        poisons
+                return variants, None, poisons
+            elif res_t["status"] == "wide":
+                ev = {"kind": kind, "rule": r, "stage": "phase",
+                      "display": tt.display,
+                      "banners": res_t["banners"],
+                      "change": "%s address chosen from %s at "
+                                "runtime" %
+                                ("src" if kind == "nat" else "dst",
+                                 res_t["net"])}
+                events.append(ev)
+                if kind == "nat":
+                    pkt.src = None
+                else:
+                    pkt.dst = None
+            else:
+                poisons.append("translation rule %s rewrites the "
+                               "packet but the resulting address "
+                               "cannot be computed %s" %
+                               (r.where(), " ".join(res_t["banners"])))
+            break
+        if poisons and not applied:
+            # an undecidable earlier rule poisons this phase section
+            pass
+    if poisons:
+        return [(pkt, events)], ("poison", poisons), poisons
+    # pass modifier short-circuits the filter phase (PF06)
+    if pass_rule is not None:
+        return [(pkt, events)], ("pass_pending", pass_rule), poisons
+    return [(pkt, events)], None, poisons
+
+
+# --------------------------------------------------------- evaluation
+
+def build_coverage(parser, ctx, dialect):
+    cov = []
+    if dialect == "openbsd":
+        cov.append("dialect: OpenBSD 7.0 (pinned semantics)")
+    else:
+        cov.append("dialect: FreeBSD 14.0 (second mode, pinned "
+                   "semantics)")
+    if parser.files_read:
+        cov.append("files read: " + ", ".join(parser.files_read))
+    for (scope, name), t in sorted(parser.tables.items()):
+        bits = []
+        bits.append("const" if t.const else "runtime-mutable")
+        bits.append("%d entr%s in file" %
+                    (len(t.entries), "y" if len(t.entries) == 1
+                     else "ies"))
+        if t.files:
+            bits.append("file: " + ", ".join(t.files))
+        if t.no_list and not t.entries and not t.files:
+            bits.append("no contents in file (persist placeholder)")
+        cov.append("table <%s> (%s:%d): %s" %
+                   (name, t.file, t.line, "; ".join(bits)))
+    for f, l, text in parser.settings["inventory"]:
+        cov.append("option not modelled: %s:%d %s" % (f, l, text))
+    if parser.settings["state_policy"]:
+        cov.append("state policy: %s [state-policy-inventory]" %
+                   parser.settings["state_policy"])
+    if parser.settings["state_defaults"]:
+        cov.append("state defaults: %s [state-defaults-inventory]" %
+                   parser.settings["state_defaults"])
+    for node in sorted(parser.anchors.values(), key=lambda n: n.path):
+        if node.wildcard:
+            cov.append("anchor %r (%s:%d): wildcard — runtime "
+                       "children possible" %
+                       (node.name, node.file, node.line))
+        elif node.has_contents:
+            cov.append("anchor %r (%s:%d): %d item(s) in file" %
+                       (node.name, node.file, node.line,
+                        len(node.children)))
+        else:
+            cov.append("anchor %r (%s:%d): contents loaded at "
+                       "runtime (not in file)" %
+                       (node.name, node.file, node.line))
+    for f, l, text in parser.limiters:
+        cov.append("limiter statement not modelled: %s:%d %s"
+                   " [state-limiter-runtime]" % (f, l, text))
+    # interface terms whose addresses were never supplied (PF14/PF28)
+    cov.append("loopback interface name assumed: lo0")
+    return cov
+
+
+def evaluate(parser, args):
+    ctx = Ctx(args, parser)
+    dialect = parser.dialect
+    o = Outcome()
+    p = parser
+    # set skip is checked before the walk (PF24)
+    skip_hit = None
+    for name in p.settings["skip"]:
+        if name == ctx.iface:
+            skip_hit = name
+            break
+        if name in ctx.iface_groups and \
+                ctx.iface in ctx.iface_groups[name]:
+            skip_hit = name
+            break
+        import fnmatch
+        if "*" in name and fnmatch.fnmatchcase(ctx.iface, name):
+            skip_hit = name
+            break
+    if skip_hit is not None:
+        line = p.settings["skip_lines"][-1] if \
+            p.settings["skip_lines"] else ("?", 0)
+        o.verdict = "PASS"
+        o.decider = None
+        o.findings.append("decided by set skip at %s:%s" % line)
+        o.banners.append("[interface-skipped-unfiltered]")
+        o.state = "state: none"
+        o.pkt_after = Packet(ctx)
+        o.coverage = build_coverage(p, ctx, dialect)
+        o.findings = p.findings + o.findings
+        return o, ctx
+
+    walk_findings = []
+    entries = flatten_filter(p.items, ctx, walk_findings)
+    pkt0 = Packet(ctx)
+    phase_events = []
+    pass_override = None
+    phase_poison = None
+    if dialect == "freebsd":
+        t_entries = flatten_trans(p.items, ctx)
+        variants, override, poisons = fbsd_phase(t_entries, ctx,
+                                                 pkt0.copy())
+        if override is not None and override[0] == "poison":
+            phase_poison = override[1]
+        elif override is not None and override[0] == "pass_pending":
+            pass_override = override[1]
+        outcomes = []
+        if phase_poison:
+            oo = Outcome()
+            oo.verdict = "UNKNOWN"
+            oo.unknown_reason = phase_poison[0]
+            outcomes = [oo]
+        elif pass_override is not None:
+            # a translation rule with `pass` decides outright (PF06)
+            oo = Outcome()
+            oo.verdict = "PASS"
+            oo.decider = pass_override
+            oo.translations = variants[0][1] if variants else []
+            oo.pkt_after = variants[0][0] if variants else pkt0
+            oo.state = _state_text_for_trans(pass_override)
+            outcomes = [oo]
+        else:
+            for pk, evs in variants:
+                sts = _walk_states(entries, ctx, pk)
+                for st in sts:
+                    oo = _finish_state(st, ctx, p)
+                    oo.translations = evs + oo.translations
+                    outcomes.append(oo)
+        o = merge_outcomes(outcomes)
+    else:
+        sts = _walk_states(entries, ctx, pkt0)
+        outcomes = [_finish_state(st, ctx, p) for st in sts]
+        o = merge_outcomes(outcomes)
+    o.findings = walk_findings + p.findings + o.findings + \
+        o.branch_notes
+    # ether rules (PF07/PF32)
+    if p.ether_rules:
+        o.coverage.append("[ethernet-filtering-present] the file "
+                          "contains ether rules; they are not "
+                          "evaluated by v1")
+        may = any((er.on_name in (None, ctx.iface)) and
+                  (er.direction in (None, ctx.direction))
+                  for er in p.ether_rules)
+        if may and o.verdict in ("PASS", "DEFAULT-PASS"):
+            er = next(er for er in p.ether_rules
+                      if (er.on_name in (None, ctx.iface)) and
+                      (er.direction in (None, ctx.direction)))
+            o.verdict = "UNKNOWN"
+            o.unknown_reason = ("ether rule at %s:%d may decide "
+                                "this packet at layer 2 before pf "
+                                "filtering [ethernet-filtering-present]"
+                                % (er.file, er.line))
+    # global banners (PF26 / PF19 / PF27)
+    opt = p.settings["optimization"]
+    if opt != "none":
+        o.banners.append("[ruleset-optimization-active]")
+    if p.settings["syncookies"] in ("always", "adaptive") and \
+            o.verdict == "BLOCK":
+        o.banners.append("[syncookies-answer-before-drop]")
+    if ctx.fragment and not p.settings["reassemble"] and \
+            o.verdict in ("PASS", "BLOCK", "DEFAULT-PASS"):
+        o.banners.append("[fragment-no-state]")
+    for r in o.matched:
+        if r.state_mode in ("modulate", "synproxy") and \
+                r.flags_term == ("any",):
+            o.banners.append("[modulate-flags-any-ack-storm-risk]")
+            break
+    if o.decider is not None and \
+            o.decider.state_mode in ("modulate", "synproxy") and \
+            o.decider.flags_term == ("any",):
+        if "[modulate-flags-any-ack-storm-risk]" not in o.banners:
+            o.banners.append("[modulate-flags-any-ack-storm-risk]")
+    if o.decider is not None and o.decider.once:
+        o.banners.append("[once-rule-may-have-fired]")
+    if ctx.direction == "in" and o.decider is not None:
+        # tag set only in the other direction's walk (PF30)
+        pass
+    o.coverage = build_coverage(p, ctx, dialect) + o.coverage
+    if o.pkt_after is None:
+        o.pkt_after = pkt0
+    return o, ctx
+
+
+def _state_text_for_trans(r):
+    if r.pass_mod:
+        return "state: created (keep state)"
+    return "state: none"
+
+
+# ---------------------------------------------------------- rendering
+
+def verdict_line(o):
+    if o.verdict == "PASS":
+        if o.decider is not None:
+            return "VERDICT PASS — decider %s" % o.decider.chain_label()
+        return "VERDICT PASS — interface skipped (set skip)"
+    if o.verdict == "DEFAULT-PASS":
+        return ("VERDICT DEFAULT-PASS — no rule matched; pf passes "
+                "the packet by default [default-pass-no-rule-matched]")
+    if o.verdict == "BLOCK":
+        if o.decider is not None:
+            return "VERDICT BLOCK (%s) — decider %s" % (
+                o.mechanism, o.decider.chain_label())
+        return "VERDICT BLOCK (%s) — implicit rule" % o.mechanism
+    if o.verdict == "UNKNOWN":
+        return "VERDICT UNKNOWN — %s" % o.unknown_reason
+    if o.verdict == "AMBIGUOUS":
+        return "VERDICT AMBIGUOUS — %s" % o.unknown_reason
+    return "VERDICT %s" % o.verdict
+
+
+def render_text(o, ctx):
+    lines = [verdict_line(o)]
+    if o.translations:
+        lines.append("translation:")
+        for ev in o.translations:
+            r = ev.get("rule")
+            ref = r.where() if r is not None else "?"
+            lab = ' "%s"' % r.label if r is not None and r.label else ""
+            b = " " + " ".join(ev.get("banners", [])) \
+                if ev.get("banners") else ""
+            note = " (%s)" % ev["port_note"] if ev.get("port_note") \
+                else ""
+            lines.append("  %s %s %s-to %s — %s%s%s" %
+                         (ref, ev.get("stage", "rule"), ev["kind"],
+                          ev.get("display", ""), ev.get("change", ""),
+                          note, b))
+    if o.state:
+        lines.append(o.state)
+    if o.pkt_after is not None:
+        lines.append("packet after translation: %s" %
+                     o.pkt_after.desc())
+    if o.matched:
+        lines.append("matched rules:")
+        for r in o.matched:
+            mark = " — DECIDER" if o.decider is r else ""
+            lines.append("  %s%s" % (r.chain_label(), mark))
+    all_findings = list(o.findings)
+    for b in o.banners:
+        if not any(b in f for f in all_findings):
+            all_findings.append(b)
+    if all_findings:
+        lines.append("findings:")
+        for f in all_findings:
+            lines.append("  " + f)
+    if o.coverage:
+        lines.append("coverage:")
+        for c in o.coverage:
+            lines.append("  " + c)
+    return "\n".join(lines)
+
+
+def render_json(o, ctx, parser):
+    def rule_json(r):
+        if r is None:
+            return None
+        return {"file": r.file, "line": r.line, "action": r.action,
+                "anchor": list(r.anchor), "label": r.label,
+                "rule": r.nr}
+    data = {
+        "verdict": o.verdict,
+        "mechanism": o.mechanism,
+        "decider": rule_json(o.decider),
+        "default_pass": o.verdict == "DEFAULT-PASS",
+        "unknown_reason": o.unknown_reason,
+        "translations": [
+            {"rule": rule_json(ev.get("rule")), "kind": ev["kind"],
+             "stage": ev.get("stage"), "target": ev.get("display"),
+             "change": ev.get("change"),
+             "banners": ev.get("banners", [])}
+            for ev in o.translations],
+        "matched": [dict(rule_json(r),
+                         **{"decider": o.decider is r})
+                    for r in o.matched],
+        "state": o.state,
+        "banners": o.banners,
+        "findings": o.findings,
+        "coverage": o.coverage,
+        "packet_after": o.pkt_after.desc() if o.pkt_after else None,
+        "dialect": parser.dialect,
+        "files_read": parser.files_read,
+    }
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
+# ----------------------------------------------------------- inventory
+
+def inv_rules(parser):
+    out = []
+    for r in parser.iter_rules(parser.items):
+        anch = " [anchor %s]" % " / ".join(r.anchor) if r.anchor else ""
+        lab = ' "%s"' % r.label if r.label else ""
+        out.append("%s #%d %s%s%s" % (r.where(), r.nr, r.raw.strip(),
+                                      anch, lab))
+    return "\n".join(out)
+
+
+def inv_tables(parser):
+    out = []
+    for (scope, name), t in sorted(parser.tables.items()):
+        sc = "/".join(scope) if scope else "global"
+        out.append("%s table <%s> [%s] attrs=%s entries=%d files=%s" %
+                   (t.where(), name, sc,
+                    ",".join(sorted(t.attrs)) or "-",
+                    len(t.entries), ",".join(t.files) or "-"))
+    return "\n".join(out)
+
+
+def inv_anchors(parser):
+    out = []
+    for path, node in sorted(parser.anchors.items()):
+        state = "in file (%d items)" % len(node.children) \
+            if node.has_contents else "runtime-loaded (unknown)"
+        if node.wildcard:
+            state += "; wildcard"
+        out.append("%s anchor %r kind=%s %s" %
+                   (node.where(), node.name, node.kind, state))
+    return "\n".join(out)
+
+
+def inv_macros(parser):
+    out = []
+    for name, m in sorted(parser.macros.items()):
+        out.append("%s %s = %r" % (m.where(), name, m.value))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- main
+
+def build_arg_parser():
+    ap = argparse.ArgumentParser(
+        prog="pfwho",
+        description="Which pf.conf rule decided this packet, and "
+                    "what translation was applied? (pinned to "
+                    "OpenBSD 7.0; FreeBSD 14.0 second mode)")
+    ap.add_argument("direction", choices=["in", "out"])
+    ap.add_argument("--on", required=True,
+                    help="interface the packet is on")
+    ap.add_argument("--af", choices=["inet", "inet6"], default=None)
+    ap.add_argument("--proto", default=None,
+                    help="protocol name or number (tcp, udp, icmp...)")
+    ap.add_argument("--from", dest="src", default=None)
+    ap.add_argument("--sport", type=int, default=None)
+    ap.add_argument("--to", dest="dst", default=None)
+    ap.add_argument("--dport", type=int, default=None)
+    ap.add_argument("--tcp-flags", default=None,
+                    help="e.g. S, SA, A, or 'any' (default for tcp: S)")
+    ap.add_argument("--icmp-type", default=None,
+                    help="type[/code], number or name (e.g. echoreq)")
+    ap.add_argument("--fragment", action="store_true")
+    ap.add_argument("--ip-options", action="store_true",
+                    help="the packet carries IP options")
+    ap.add_argument("--tos", default=None)
+    ap.add_argument("--tagged", default=None)
+    ap.add_argument("--user", default=None)
+    ap.add_argument("--group", default=None)
+    ap.add_argument("--os", default=None)
+    ap.add_argument("--received-on", default=None)
+    ap.add_argument("--rdomain", type=int, default=None)
+    ap.add_argument("--prio", type=int, default=None,
+                    help="packet priority (default 3)")
+    ap.add_argument("--iface-addr", action="append", default=[],
+                    metavar="IFACE=ADDR[,ADDR...]")
+    ap.add_argument("--iface-group", action="append", default=[],
+                    metavar="NAME=IFACE[,IFACE...]")
+    ap.add_argument("--egress", default=None)
+    ap.add_argument("--self", dest="self_addrs", default=None,
+                    metavar="ADDR[,ADDR...]")
+    ap.add_argument("--conf", default=None)
+    ap.add_argument("--dialect", choices=["openbsd", "freebsd", "auto"],
+                    default="auto")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--list-rules", action="store_true")
+    ap.add_argument("--list-tables", action="store_true")
+    ap.add_argument("--list-anchors", action="store_true")
+    ap.add_argument("--list-macros", action="store_true")
+    ap.add_argument("--version", action="version",
+                    version="pfwho " + VERSION)
+    return ap
+
+
+def main(argv=None):
+    load_name_tables()
+    ap = build_arg_parser()
+    args = ap.parse_args(argv)
+    conf = args.conf
+    if conf is None:
+        if os.path.exists("/etc/pf.conf"):
+            conf = "/etc/pf.conf"
+        else:
+            print("pfwho: no --conf given and /etc/pf.conf does not "
+                  "exist (searched: /etc/pf.conf)", file=sys.stderr)
+            return 2
+    args.conf = conf
+    # normalise proto / icmp / tos
+    args.proto_num = None
+    args.proto_name = None
+    if args.proto is not None:
+        if args.proto.isdigit():
+            args.proto_num = int(args.proto)
+        else:
+            args.proto_name = args.proto.lower()
+    args.icmp_type_v = None
+    if args.icmp_type is not None:
+        s = args.icmp_type
+        code = None
+        if "/" in s:
+            s, c = s.split("/", 1)
+            code = int(c) if c.isdigit() else None
+        if s.isdigit():
+            args.icmp_type_v = (int(s), code)
+        elif s in ICMP_TYPES:
+            args.icmp_type_v = (ICMP_TYPES[s], code)
+        elif s in ICMP6_TYPES:
+            args.icmp_type_v = (ICMP6_TYPES[s], code)
+        else:
+            print("pfwho: unknown --icmp-type %r" % args.icmp_type,
+                  file=sys.stderr)
+            return 2
+    args.tos_v = None
+    if args.tos is not None:
+        try:
+            args.tos_v = parse_tos_value(args.tos)
+        except ConfigError as e:
+            print("pfwho: %s" % e, file=sys.stderr)
+            return 2
+    try:
+        parser = Parser(conf).parse(forced_dialect=args.dialect)
+        if args.list_rules:
+            print(inv_rules(parser))
+            return 0
+        if args.list_tables:
+            print(inv_tables(parser))
+            return 0
+        if args.list_anchors:
+            print(inv_anchors(parser))
+            return 0
+        if args.list_macros:
+            print(inv_macros(parser))
+            return 0
+        outcome, ctx = evaluate(parser, args)
+    except ConfigError as e:
+        print("pfwho: config error: %s" % e, file=sys.stderr)
+        return 2
+    except (ValueError, KeyError) as e:
+        print("pfwho: error: %s" % e, file=sys.stderr)
+        return 2
+    if args.json:
+        print(render_json(outcome, ctx, parser))
+    elif args.quiet:
+        print(verdict_line(outcome))
+    else:
+        print(render_text(outcome, ctx))
+    if outcome.verdict in ("PASS", "DEFAULT-PASS"):
+        return 0
+    if outcome.verdict == "BLOCK":
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
