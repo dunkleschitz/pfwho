@@ -199,3 +199,20 @@ python3 test_pfwho.py
 evaluation order, matching, tables, anchors, both translation
 models, state/limits/routing, scrub/antispoof/tags, output fidelity
 and safety), all hermetic subprocess runs against temp fixtures.
+
+## Pre-publish checklist
+
+- [x] `python3 test_pfwho.py` green (114 tests)
+- [x] `doccover` clean over README vs `--help`
+- [x] `clicheck` (strict mode) clean (16/16)
+- [x] `prepublish-check` clean (stdlib-only, no secret-like literals)
+- [x] `bench-audit` clean (map entry added for pfwho)
+- [x] MIT LICENSE, copyright holder `dunkleschitz`
+- [x] CI workflow `.github/workflows/tests.yml` (Python 3.12,
+  runs `python3 test_pfwho.py`)
+- [x] Design review BUILD APPROVED (DESIGN-pfwho.md, 2026-11-10);
+  publish approved by Sam Nov 10, 2026 ("Concur on all projects")
+
+## License
+
+MIT — see LICENSE.
